@@ -137,6 +137,11 @@ public:
     /// The code heap's size: the shared block's CDRAM holds its first megabyte or more, uncached
     /// main memory mapped after it the rest (DOUTU reaches 8 MiB from the code base).
     static constexpr u32 CodeBytes = 4u << 20;
+    /// The stream-out renders' recipes (Kind::Stream) at most, each a block of the stream pool
+    /// and a megabyte of GPU addresses: the geometry-shader batches of an effect-heavy frame
+    /// (MHXX) ran short of the 16 instances they shared with the texture side renders, waiting on
+    /// the GPU for a recipe.
+    static constexpr u32 StreamInstances = 32;
     /// USSE code: its offset from code base HeapCodeBase(cb) (cb 0 vertex, 1 pixel).
     u32 PlaceCode(unsigned cb, std::span<const u64> words);
     /// The code heap's bytes free now: its free ranges and its unused end, once the code given
@@ -719,7 +724,9 @@ public:
                                u32* ta_us = nullptr, u32* d3_us = nullptr);
 
 private:
-    enum class Kind : u8 { Linear, Pica, Side };
+    /// Stream: StreamRender's geometry-shader batches, apart from the texture side renders' Side
+    /// recipe so that their small recipes come from the stream pool (below), more at a time.
+    enum class Kind : u8 { Linear, Pica, Side, Stream };
     struct Recipe {
         SgxdRecipe recipe{};
         u8* memory{};
@@ -727,6 +734,7 @@ private:
         u32 size{};
         int block{-1};
         int shell_slot{-1}; // its block's slot in the shell's CDRAM, or -1: its own block
+        int stream_slot{-1}; // its block's slot in the stream pool, or -1 (shell_slot or own)
         u32 width{}, height{};
         u32 bg_offset{}; // the background colour word and its SA secondary, after the layout
         Kind kind{};
@@ -757,6 +765,22 @@ private:
     [[nodiscard]] u32 ShellSlotVa(u32 slot) const {
         return shell_slots_va + slot * (1u << 20);
     }
+    /// A stream recipe's block in the stream pool: its layout at StreamMaxDraws draws on a 32x32
+    /// target is 42 KiB, and the background page after it makes 48 KiB.
+    static constexpr u32 StreamBlockSize = 64u << 10;
+    /// The stream pool: StreamInstances blocks of the game's CDRAM in one allocation (a multiple
+    /// of 256 KiB, as the kernel takes CDRAM), made at the first stream recipe, so a game without
+    /// geometry shaders spends none. Each block has a GPU window of its own (a recipe's base is
+    /// 1 MiB aligned), all mapped at once with that one GPU idle; a recipe made in a block maps
+    /// nothing. 2 MiB in all, where the stream renders took 512 KiB shell slots before.
+    static constexpr u32 StreamPoolSize = StreamInstances * StreamBlockSize;
+    static_assert(StreamPoolSize % (256u << 10) == 0 && StreamInstances <= 64);
+    u8* stream_pool{};
+    int stream_pool_block{-1};
+    bool stream_pool_tried{}; ///< made, or found no CDRAM once: stream recipes then take blocks
+    u64 stream_slots_used{};  ///< a bit a block
+    /// Makes the stream pool if CDRAM has room for it and a margin; false: no pool.
+    bool MakeStreamPool();
     void FreeRecipeBlock(const Recipe& r);
 
     /// The recipe for a width x height target of kind, made at its first use. A PICA recipe's
@@ -1157,6 +1181,8 @@ public:
 #if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
     /// Tools builds' cpu line: the render thread's GPU waits by site since the last call.
     [[nodiscard]] static std::string ToolsWaitSites();
+    /// Tools builds' cpu line: the Kind::Stream recipes made since the start.
+    [[nodiscard]] static u32 ToolsStreamRecipes();
 #endif
 private:
 

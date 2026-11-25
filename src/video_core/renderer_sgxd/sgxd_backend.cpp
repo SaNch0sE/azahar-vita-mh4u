@@ -139,8 +139,17 @@ std::array<ToolsWaitSite, 16> tools_wait_sites{};
 
 // GPU address map: docs/sgxd/memory.md.
 constexpr u32 BlockVa = 0x04000000;
-// With the shared parameter buffer, every block within 256 MiB of the DPM requestor base.
-constexpr u32 RecipesEnd = 0x11000000;
+// With the shared parameter buffer, every block within 256 MiB of the DPM requestor base
+// (sgxd_present.cpp's RecipeVa, 16 MiB): the recipes' GPU addresses end at 272 MiB. Its last
+// StreamInstances megabytes are the stream pool's windows, one a block (StreamSlotVa); the shell's
+// slots and the recipes in blocks of their own (next_va) take the addresses below them. Nothing
+// else is mapped from the shell slots up to guest VRAM (0x18000000).
+constexpr u32 RecipesTop = 0x11000000;
+constexpr u32 StreamPoolVa = RecipesTop - SgxdBackend::StreamInstances * (1u << 20);
+constexpr u32 RecipesEnd = StreamPoolVa;
+// A stream recipe's identity indices: none of its draws reads them, as each brings its own index
+// list (StreamRender); the layout's draws at init are one triangle.
+constexpr u32 StreamIndices = 3;
 constexpr u32 SurfacesVa = 0x48000000;
 constexpr u32 SurfacesSize = 8u << 20;
 // Host copies are U8888: 8 times an ETC1 texture's bytes. The fixed part grows down from the top.
@@ -177,6 +186,14 @@ constexpr u32 LutSize = LutLfSize + LutRgSize + LutRgbaSize + LutLfHalfSize;
 constexpr u32 AlignUp(u32 value, u32 align) {
     return (value + align - 1) & ~(align - 1);
 }
+
+constexpr u32 StreamSlotVa(u32 slot) {
+    return StreamPoolVa + slot * (1u << 20);
+}
+
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+std::atomic<u32> tools_stream_recipes{};
+#endif
 
 // A block mapped at va for the GPU, in CDRAM: uncached for the CPU, so what it writes needs no
 // cache work. Without CDRAM it stops. `size` is a multiple of 256 KiB.
@@ -281,6 +298,7 @@ SgxdBackend::SgxdBackend() {
                    ShellSlotVa(slot), static_cast<u32>(mapped));
     }
     next_va = ShellSlotVa(ShellSlots);
+    ASSERT_MSG(next_va < RecipesEnd, "sgxd: the shell's slots reach the stream pool's windows");
     sgxd_recipe_code_heap = BlockVa + code_begin;
     draws.resize(MaxDraws);
     programs.resize(MaxDraws);
@@ -591,6 +609,12 @@ SgxdBackend::~SgxdBackend() {
     for (u32 slot = 0; slot < ShellSlots; slot++) {
         sgxdUnmap(ShellSlotVa(slot), RecipeBlockSize);
     }
+    if (stream_pool != nullptr) {
+        for (u32 slot = 0; slot < StreamInstances; slot++) {
+            sgxdUnmap(StreamSlotVa(slot), StreamBlockSize);
+        }
+        sceKernelFreeMemBlock(stream_pool_block);
+    }
     sgxdUnmap(PdsWindowVa, PdsWindows * PdsHalfSize);
     FreeBlock(shared, BlockVa, shared_size, shared_block);
     FreeBlock(code_main, BlockVa + shared_size, CodeSize - code_cdram, code_main_block);
@@ -603,12 +627,63 @@ SgxdBackend::~SgxdBackend() {
 }
 
 void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
+    if (r.stream_slot >= 0) {
+        // As a shell slot: the pool's block stays mapped at its window for the next stream recipe.
+        stream_slots_used &= ~(u64{1} << r.stream_slot);
+        return;
+    }
     if (r.shell_slot < 0) {
         FreeBlock(r.memory, r.va, r.size, r.block);
         return;
     }
     // Its slot stays mapped at its address for the next recipe there (its render is done).
     shell_slots_used &= ~(u64{1} << r.shell_slot);
+}
+
+bool SgxdBackend::MakeStreamPool() {
+    if (stream_pool_tried) {
+        return stream_pool != nullptr;
+    }
+    stream_pool_tried = true;
+    // The pool is CDRAM no other recipe can take back, so only with room for it beside the
+    // margin RecipeFor keeps: else the stream recipes take blocks like the others'.
+    SceKernelFreeMemorySizeInfo free{};
+    free.size = sizeof(free);
+    sceKernelGetFreeMemorySize(&free);
+    if (static_cast<u32>(free.size_cdram) < StreamPoolSize + RecipeCdramMargin) {
+        LOG_WARNING(Render, "sgxd: no stream pool, {} KiB of CDRAM free",
+                    static_cast<u32>(free.size_cdram) >> 10);
+        return false;
+    }
+    stream_pool_block = sceKernelAllocMemBlock(
+        "azahar-sgxd-stream", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, StreamPoolSize, nullptr);
+    void* base = nullptr;
+    if (stream_pool_block < 0 || sceKernelGetMemBlockBase(stream_pool_block, &base) < 0) {
+        LOG_WARNING(Render, "sgxd: no stream pool: no {} KiB block of CDRAM ({:#010x})",
+                    StreamPoolSize >> 10, static_cast<u32>(stream_pool_block));
+        if (stream_pool_block >= 0) {
+            sceKernelFreeMemBlock(stream_pool_block);
+        }
+        stream_pool_block = -1;
+        return false;
+    }
+    // As MapBlock: the GPU's MMU takes the windows with no PTLA op in flight, and the SLC, which
+    // its table walks go through, is emptied after. The windows are new addresses no work used.
+    [[maybe_unused]] const int idle = sgxd_gpu_idle();
+    DEBUG_ASSERT_MSG(idle == 0, "sgxd: a PTLA op never completed before mapping the stream pool");
+    for (u32 slot = 0; slot < StreamInstances; slot++) {
+        u8* const block = static_cast<u8*>(base) + slot * StreamBlockSize;
+        const int mapped = sgxdMap(StreamSlotVa(slot), block, StreamBlockSize, 0);
+        ASSERT_MSG(mapped == 0,
+                   "sgxd: the stream pool's block {} not mapped at GPU {:#010x}: {:#010x}", slot,
+                   StreamSlotVa(slot), static_cast<u32>(mapped));
+    }
+    [[maybe_unused]] const int slc = sgxd_slc_invalidate();
+    DEBUG_ASSERT_MSG(slc == 0, "sgxd: the SLC not emptied after mapping the stream pool");
+    stream_pool = static_cast<u8*>(base);
+    LOG_INFO(Render, "sgxd: the stream pool, {} KiB of CDRAM: {} blocks of {} KiB at GPU {:#010x}",
+             StreamPoolSize >> 10, StreamInstances, StreamBlockSize >> 10, StreamPoolVa);
+    return true;
 }
 
 SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u32 samples) {
@@ -632,9 +707,19 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
             }
         }
     }
-    if (instances >= MaxInstances && oldest) {
+    if (instances >= (kind == Kind::Stream ? StreamInstances : MaxInstances) && oldest) {
         RenderWait(oldest->fence, "a recipe instance");
         return *oldest;
+    }
+    // A stream recipe takes a free block of the stream pool, which holds StreamInstances: no CDRAM
+    // to find, nothing to wait for or take back. Without the pool it is made like the others.
+    int stream_slot = -1;
+    if (kind == Kind::Stream && MakeStreamPool()) {
+        for (u32 k = 0; k < StreamInstances && stream_slot < 0; k++) {
+            if ((stream_slots_used >> k & 1) == 0) {
+                stream_slot = static_cast<int>(k);
+            }
+        }
     }
     // CDRAM bounds the instances in all: with less free than a block and a margin, and an instance
     // of the size in flight, that one's render is waited for.
@@ -647,20 +732,21 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         sceKernelGetFreeMemorySize(&free);
         return static_cast<u32>(free.size_cdram) < RecipeBlockSize + RecipeCdramMargin;
     };
-    if (oldest && cdram_short()) {
+    if (stream_slot < 0 && oldest && cdram_short()) {
         RenderWait(oldest->fence, "a recipe instance (CDRAM)");
         return *oldest;
     }
     // A size's first instance, or one beside its pending render's, with little CDRAM free: the
     // recipes are a cache, and the one used longest ago gives its block back once its render is
-    // done. Never the open pass's or the pending render's.
+    // done. Never the open pass's or the pending render's, nor a stream pool's block, which gives
+    // no CDRAM back.
     u32 va = next_va;
     u32 va_end = RecipesEnd;
-    if (!recipes.empty() && cdram_short()) {
+    if (stream_slot < 0 && !recipes.empty() && cdram_short()) {
         auto victim = recipes.end();
         for (auto it = recipes.begin(); it < recipes.end(); ++it) {
             const Recipe& s = **it;
-            if (&s != pending && &s != current && &s != parked_recipe &&
+            if (&s != pending && &s != current && &s != parked_recipe && s.stream_slot < 0 &&
                 (victim == recipes.end() || static_cast<s32>(s.fence - (*victim)->fence) < 0)) {
                 victim = it;
             }
@@ -691,12 +777,15 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         recipes.erase(victim);
     }
     int slot = -1;
-    for (u32 k = 0; k < ShellSlots && slot < 0; k++) {
+    for (u32 k = 0; k < ShellSlots && slot < 0 && stream_slot < 0; k++) {
         if ((shell_slots_used >> k & 1) == 0) {
             slot = static_cast<int>(k);
         }
     }
-    if (slot >= 0) {
+    if (stream_slot >= 0) {
+        va = StreamSlotVa(static_cast<u32>(stream_slot));
+        va_end = va + StreamBlockSize;
+    } else if (slot >= 0) {
         va = ShellSlotVa(static_cast<u32>(slot));
         va_end = va + RecipeBlockSize;
     }
@@ -712,19 +801,28 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
     // pages, take no CDRAM.
     sgxd_recipe_external_fb = 1;
     sgxd_recipe_samples = samples;
+    // A stream recipe's layout holds StreamMaxDraws draws, and no index a draw of it reads: the
+    // others' MaxDraws and MaxIndices would make it a 430 KiB layout, as the side recipe's.
+    const bool stream = kind == Kind::Stream;
     [[maybe_unused]] const int init = sgxd_recipe_init_programs(
-        &r.recipe, width, height, r.va, Pages, identity.data(), MaxIndices, init_draws.data(),
-        MaxDraws);
+        &r.recipe, width, height, r.va, Pages, identity.data(), stream ? StreamIndices : MaxIndices,
+        init_draws.data(), stream ? StreamMaxDraws : MaxDraws);
     sgxd_recipe_external_fb = 0;
     sgxd_recipe_samples = 1;
     DEBUG_ASSERT_MSG(init == 0, "sgxd: the recipe does not take a {}x{} target", width, height);
     r.bg_offset = AlignUp(r.recipe.offset[SGXD_R_END], 0x1000);
-    r.size = AlignUp(r.bg_offset + 0x1000, 256u << 10);
-    DEBUG_ASSERT_MSG(r.size <= RecipeBlockSize, "sgxd: a {}x{} recipe takes {} KiB, past {}", width,
-                     height, r.size >> 10, RecipeBlockSize >> 10);
+    // A block of its own is whole 256 KiB, as the kernel gives CDRAM; a pool's block is its pages.
+    r.size = AlignUp(r.bg_offset + 0x1000, stream_slot >= 0 ? 0x1000 : 256u << 10);
+    DEBUG_ASSERT_MSG(r.size <= (stream_slot >= 0 ? StreamBlockSize : RecipeBlockSize),
+                     "sgxd: a {}x{} recipe takes {} KiB, past its block's {}", width, height,
+                     r.size >> 10, (stream_slot >= 0 ? StreamBlockSize : RecipeBlockSize) >> 10);
     ASSERT_MSG(r.va + r.size <= va_end, "sgxd: no GPU space for a {}x{} recipe at {:#010x}", width,
                height, r.va);
-    if (slot >= 0) {
+    if (stream_slot >= 0) {
+        stream_slots_used |= u64{1} << stream_slot;
+        r.stream_slot = stream_slot;
+        r.memory = stream_pool + static_cast<u32>(stream_slot) * StreamBlockSize;
+    } else if (slot >= 0) {
         shell_slots_used |= u64{1} << slot;
         r.shell_slot = slot;
         r.memory = shell_cdram + static_cast<u32>(slot) * RecipeBlockSize;
@@ -748,13 +846,20 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         sgxd_recipe_set_pixel_event(&r.recipe, sgxd_recipe_va(&r.recipe, SGXD_R_PIXEV), 4, 4);
     }
     sgxd_recipe_sa_background(&r.recipe, r.memory, r.bg_offset, 0xff000000u);
-    static constexpr const char* kinds[] = {"linear", "PICA", "side"};
+    static constexpr const char* kinds[] = {"linear", "PICA", "side", "stream-out"};
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    if (stream) {
+        tools_stream_recipes.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
     LOG_INFO(Render,
              "sgxd: the rasterizer's {}x{} {}{} recipe {}, {} KiB at GPU {:#010x} ({}): layout {} "
              "KiB; shared block at {:#010x}",
              width, height, kinds[static_cast<u32>(kind)], samples == 2 ? " 2x" : "", r.instance,
              r.size >> 10, r.va,
-             r.shell_slot >= 0 ? "the shell's CDRAM" : "the game's",
+             r.stream_slot >= 0  ? "the stream pool"
+             : r.shell_slot >= 0 ? "the shell's CDRAM"
+                                 : "the game's",
              r.recipe.offset[SGXD_R_END] >> 10, BlockVa);
     recipes.push_back(std::move(made));
     return r;
@@ -2586,6 +2691,10 @@ std::string SgxdBackend::ToolsWaitSites() {
     }
     return out;
 }
+
+u32 SgxdBackend::ToolsStreamRecipes() {
+    return tools_stream_recipes.load(std::memory_order_relaxed);
+}
 #endif
 
 void SgxdBackend::RenderAsync(Recipe& r, const u32 touches[6]) {
@@ -3336,9 +3445,12 @@ void SgxdBackend::FlushStreamOut(bool wait) {
 
 void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     DEBUG_ASSERT(in_pass && !queued.empty() && queued.size() <= StreamMaxDraws);
-    Recipe& r = RecipeFor(UntileSide, UntileSide, Kind::Side);
+    // A recipe of its own kind and size (its 32x32 target's, at most StreamMaxDraws draws): small,
+    // so many renders can be in flight (StreamInstances). Its draws read their own index lists
+    // (a0_indices, a1_indices), never the recipe's identity indices, which it hardly has.
+    Recipe& r = RecipeFor(32, 32, Kind::Stream);
     PlaceFixedPrograms();
-    // At its 32x32 target's size, as SideRender sizes the recipe (whatever it drew last).
+    // At its 32x32 target's size, as SideRender sizes the recipe: its layout's own size, made so.
     [[maybe_unused]] const int sized = sgxd_recipe_set_size(&r.recipe, r.memory, 32, 32);
     DEBUG_ASSERT(sized == 0);
     const PdsRef term = TermPds(r.recipe);
@@ -3361,6 +3473,8 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     for (std::size_t d = 0; d < queued.size(); d++) {
         SgxdRecipeDrawPrograms& p = untile_programs[d];
         p = queued[d].programs;
+        DEBUG_ASSERT_MSG(p.indices != 0,
+                         "sgxd: a stream-out draw without an index list of its own");
         p.fsec = fsec.va;
         p.fsec_units = fsec.units;
         p.fprim = fprim.va;

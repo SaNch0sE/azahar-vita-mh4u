@@ -2118,9 +2118,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         geo[k] = SgxdRenderer::RasterizerSgxd::ToolsGeometryDraws(k);
                     }
                     sites += fmt::format("; geometry draws queued {}, alone without a bound {}, "
-                                         "alone past the room {}",
+                                         "alone past the room {}; stream-out recipes {}",
                                          geo[0] - last_geo[0], geo[1] - last_geo[1],
-                                         geo[2] - last_geo[2]);
+                                         geo[2] - last_geo[2],
+                                         SgxdRenderer::SgxdBackend::ToolsStreamRecipes());
                     last_geo = geo;
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
