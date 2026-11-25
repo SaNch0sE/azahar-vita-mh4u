@@ -704,7 +704,8 @@ private:
                                bool forced_parallel);
     Usse::VsRequest GeometryRequest(const GeometryKey& k, u32 rows, bool rows_uniform,
                                     bool rows_table, u32 first_uniform, u16 input_rows,
-                                    u32 max_triangles, bool serial) const;
+                                    u32 max_triangles, bool serial,
+                                    bool forced_parallel) const;
     /// A new geometry draw's second program (b15 true) on the first tier's worker while this thread
     /// emits the first, when neither is placed or cached and they differ.
     void QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
@@ -713,7 +714,7 @@ private:
     const VertexProgram& MakeGeometryProgram(const GeometryKey& k, u32 rows, bool rows_uniform,
                                              bool rows_table, u32 first_uniform, u16 input_rows,
                                              u32 max_triangles, bool serial,
-                                             const Describe& describe);
+                                             bool forced_parallel, const Describe& describe);
     /// The vertex program that draws a geometry program's stored triangles: input k is output k.
     const VertexProgram& PassthroughProgramFor(u32 outputs);
     const VertexProgram& PassthroughProgramLookup(u32 outputs, u32 output_mask);
@@ -1246,8 +1247,11 @@ private:
     std::array<u32, 16> gs_last_rows{};
     /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.
     SgxdBackend::Data gs_kept_rows{};
-    /// The geometry unit's temporaries and emit buffer between draws run in order, zero at first.
-    SgxdBackend::Data gs_unit_temps{};
+    /// The geometry unit's temporaries and emit buffer between draws run in order, zero at first:
+    /// two blocks, gs_unit_current's read. A draw of trails (VsRequest::gs_trails) stores into the
+    /// other, so no instance that ends early stores over what the draw's first one still loads.
+    std::array<SgxdBackend::Data, 2> gs_unit_temps{};
+    u32 gs_unit_current = 0;
     /// A geometry draw's row no attribute fills: zeros, kept for good.
     SgxdBackend::Data gs_zero_row{};
     std::vector<u16> gs_list;

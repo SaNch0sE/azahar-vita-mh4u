@@ -110,6 +110,12 @@ struct VsRequest {
     /// and the state block (its stores); each entry is the words the parallel form's attribute
     /// holds. The count is at least one.
     bool gs_serial = false;
+    /// With gs_serial, a trail program's (GsTrailHead): one instance a trail, side by side. Each
+    /// instance's attribute is the in-order form's four words, its count negative where it starts
+    /// past the draw's first invocation: it runs only where that invocation is a trail's head (the
+    /// program's opening CMP and JMPC say so), and stops before the next head. Zero: none to run.
+    /// Only the instance that runs the draw's last invocation stores the state block.
+    bool gs_trails = false;
     /// Per-vertex effect lighting's lights (VsPvEffect), Draw mode only.
     VsPvEffect pv{};
 };
@@ -124,6 +130,15 @@ inline constexpr uint32_t GsStateQuads = 16 + 3 * 16;
 /// than once (one in a loop, or any backward jump): no bound.
 [[nodiscard]] uint32_t GsTriangleBound(std::span<const uint32_t> code, uint32_t code_size,
                                        uint32_t main_offset);
+
+/// Whether the geometry program at `main_offset` draws trails: it opens with a CMP and a JMPC to
+/// a head block that emits nothing, calls nothing, jumps nowhere and ENDs (it keeps what the
+/// trail's invocations after it read: Monster Hunter 4 Ultimate's and XX's ribbons, which keep a
+/// matrix in r11-r14, a counter in r15 and the emit buffer from one invocation to the next). The
+/// invocations from one head to the next then run in order, and the trails side by side
+/// (VsRequest::gs_trails).
+[[nodiscard]] bool GsTrailHead(std::span<const uint32_t> code, uint32_t code_size,
+                               uint32_t main_offset);
 
 /// Whether any instruction of the code, reached or not, reads a float uniform with an address
 /// register (VsRequest::gs_uniform_table).

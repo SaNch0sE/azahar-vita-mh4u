@@ -4841,7 +4841,8 @@ RasterizerSgxd::GeometryKey RasterizerSgxd::GeometryKeyFor(u32 rows, bool rows_u
 
 Usse::VsRequest RasterizerSgxd::GeometryRequest(const GeometryKey& k, u32 rows, bool rows_uniform,
                                                 bool rows_table, u32 first_uniform, u16 input_rows,
-                                                u32 max_triangles, bool serial) const {
+                                                u32 max_triangles, bool serial,
+                                                bool forced_parallel) const {
     const Pica::ShaderSetup& setup = pica.gs_setup;
     const u32 output_mask = regs.gs.output_mask;
     Usse::VsRequest request{};
@@ -4866,6 +4867,8 @@ Usse::VsRequest RasterizerSgxd::GeometryRequest(const GeometryKey& k, u32 rows, 
     request.gs_input_rows = input_rows;
     request.gs_max_triangles = max_triangles;
     request.gs_serial = serial;
+    // Both: the draw's trails, side by side (the Parallel geometry option, a trail program).
+    request.gs_trails = serial && forced_parallel;
     return request;
 }
 
@@ -4877,7 +4880,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     const VertexProgram* const found = vertex_programs.Find(k.key);
     return found ? *found
                  : MakeGeometryProgram(k, rows, rows_uniform, rows_table, first_uniform, input_rows,
-                                       max_triangles, serial, describe);
+                                       max_triangles, serial, forced_parallel, describe);
 }
 
 void RasterizerSgxd::QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_table,
@@ -4898,15 +4901,17 @@ void RasterizerSgxd::QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_ta
     }
     tier1->QueueGeometry(rest.key,
                          GeometryRequest(rest, rows, rows_uniform, rows_table, first_uniform,
-                                         input_rows, max_triangles, serial));
+                                         input_rows, max_triangles, serial, forced_parallel));
 }
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
     const GeometryKey& k, u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
-    u16 input_rows, u32 max_triangles, bool serial, const Describe& describe) {
+    u16 input_rows, u32 max_triangles, bool serial, bool forced_parallel,
+    const Describe& describe) {
     const u64 key = k.key;
-    const Usse::VsRequest request = GeometryRequest(
-        k, rows, rows_uniform, rows_table, first_uniform, input_rows, max_triangles, serial);
+    const Usse::VsRequest request =
+        GeometryRequest(k, rows, rows_uniform, rows_table, first_uniform, input_rows,
+                        max_triangles, serial, forced_parallel);
     // The second of a new draw's pair from the first tier's worker: taken first, so its slot is free.
     std::optional<ShaderTier1::Taken> taken = tier1->TakeGeometry(key);
     disk_cache.Open(title_id);
@@ -5341,9 +5346,11 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     u16 input_rows = 0;
     // A program that reads a temporary before it writes it runs its invocations in order, the
     // temporaries kept from each to the next and from the draw before, as the PICA's unit keeps them.
-    // The Parallel geometry option runs it side by side all the same (forced_parallel): each
-    // invocation starts those temporaries at (0, 0, 0, 1), as the parallel form starts them, and its
-    // emit buffer's vertices unset (the parallel form's), so an effect that counts on what the
+    // The Parallel geometry option runs it side by side all the same (forced_parallel): a trail
+    // program (Usse::GsTrailHead) in order from each trail's head, the trails side by side, which
+    // keeps everything (the in-order form's output, the same to the word on Monster Hunter XX's
+    // ribbons); any other with each invocation's temporaries at (0, 0, 0, 1), as the parallel form
+    // starts them, and its emit buffer's vertices unset, so an effect that counts on what the
     // invocation before it left loses that.
     bool serial = false;
     bool forced_parallel = false;
@@ -5361,9 +5368,17 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     programs();
     const u16 temps_read_first = static_cast<u16>(first_program->usse.gs_temps_read_first |
                                                   program->usse.gs_temps_read_first);
+    // A trail program (Usse::GsTrailHead) runs in order from each head to the next, the trails side
+    // by side: what each invocation keeps for the next, as the unit's in-order run has it.
+    bool trails = false;
     if (temps_read_first != 0) {
         if (ParallelGeometry()) {
             forced_parallel = true;
+            trails = Usse::GsTrailHead(pica.gs_setup.GetProgramCode(),
+                                       std::min<u32>(pica.gs_setup.GetBiggestProgramSize(),
+                                                     Pica::MAX_PROGRAM_CODE_LENGTH),
+                                       regs.gs.main_offset);
+            serial = trails;
         } else {
             serial = true;
         }
@@ -5391,7 +5406,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     // side by side by the option's leave; each program that reads a temporary first is logged
     // once with the temporaries it reads first and how it ran.
     {
-        const int order = serial ? 2 : forced_parallel ? 4 : 0;
+        const int order = trails ? 4 : serial ? 2 : forced_parallel ? 4 : 0;
         tools_geometry_order[order].fetch_add(1, std::memory_order_relaxed);
         tools_geometry_order[order + 1].fetch_add(invocations, std::memory_order_relaxed);
         if (temps_read_first != 0) {
@@ -5409,9 +5424,12 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                          "invocations, mode {}, rows {}, bound {}",
                          gs_key, temps_read_first, first_program->usse.gs_temps_read_first,
                          program->usse.gs_temps_read_first,
-                         serial ? "in order" : "side by side (Parallel geometry)", invocations,
+                         trails   ? "as trails side by side (Parallel geometry)"
+                         : serial ? "in order"
+                                  : "side by side (Parallel geometry)",
+                         invocations,
                          static_cast<u32>(pipeline.gs_config.mode.Value()), rows, bound);
-            }
+                        }
         }
     }
 #endif
@@ -5520,18 +5538,41 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         if (serial) {
             // One instance runs them all (VsRequest::gs_serial): its entry the count, the first table entry
             // and the unit's temporaries; the triangle that vertex three times.
-            if (!gs_unit_temps.cpu) {
-                gs_unit_temps = backend.AllocTextureFixed(Usse::GsStateQuads * 16);
-                std::memset(gs_unit_temps.cpu, 0, Usse::GsStateQuads * 16);
+            for (SgxdBackend::Data& block : gs_unit_temps) {
+                if (!block.cpu) {
+                    block = backend.AllocTextureFixed(Usse::GsStateQuads * 16);
+                    std::memset(block.cpu, 0, Usse::GsStateQuads * 16);
+                }
             }
-            const SgxdBackend::Data entries = backend.AllocData(16);
-            u32* const e = reinterpret_cast<u32*>(entries.cpu);
-            e[0] = std::bit_cast<u32>(static_cast<float>(n));
-            e[1] = gs_table.gpu + first * words * 4 - 4;
-            e[2] = gs_unit_temps.gpu - 4;
-            e[3] = gs_unit_temps.gpu;
-            a1.fetch[0] = {entries.gpu, 16, 4, in->resource};
-            a1.count = 3;
+            const u32 load = gs_unit_temps[gs_unit_current].gpu;
+            if (!trails) {
+                const SgxdBackend::Data entries = backend.AllocData(16);
+                u32* const e = reinterpret_cast<u32*>(entries.cpu);
+                e[0] = std::bit_cast<u32>(static_cast<float>(n));
+                e[1] = gs_table.gpu + first * words * 4 - 4;
+                e[2] = load - 4;
+                e[3] = load;
+                a1.fetch[0] = {entries.gpu, 16, 4, in->resource};
+                a1.count = 3;
+            } else {
+                // An instance an invocation (VsRequest::gs_trails): the first's count the
+                // invocations, the others' less theirs before it and negative, the padding's 0.
+                gs_unit_current ^= 1;
+                const u32 store = gs_unit_temps[gs_unit_current].gpu;
+                a1.count = Common::AlignUp(n, 3u);
+                const SgxdBackend::Data entries = backend.AllocData(a1.count * 16);
+                u32* const e = reinterpret_cast<u32*>(entries.cpu);
+                for (u32 i = 0; i < a1.count; i++) {
+                    const float count = i >= n ? 0.0f
+                                        : i == 0 ? static_cast<float>(n)
+                                                 : -static_cast<float>(n - i);
+                    e[i * 4] = std::bit_cast<u32>(count);
+                    e[i * 4 + 1] = gs_table.gpu + (first + std::min(i, n - 1)) * words * 4 - 4;
+                    e[i * 4 + 2] = load - 4;
+                    e[i * 4 + 3] = store;
+                }
+                a1.fetch[0] = {entries.gpu, 16, 4, in->resource};
+            }
         } else {
             a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
             a1.count = Common::AlignUp(n, 3u);
@@ -5540,7 +5581,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         u16* const list = reinterpret_cast<u16*>(a1_indices.cpu);
         DEBUG_ASSERT(invocations <= 0x10000);
         for (u32 i = 0; i < a1.count; i++) {
-            list[i] = static_cast<u16>(serial ? 0 : first + std::min(i, n - 1));
+            list[i] = static_cast<u16>(trails ? i : serial ? 0 : first + std::min(i, n - 1));
         }
         a1.indices = a1_indices.gpu;
         a1.setup = &pica.gs_setup;

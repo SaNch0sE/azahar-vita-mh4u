@@ -396,8 +396,9 @@ private:
     /// Geometry, gs_serial: the invocation's table entry (loaded words), the loop's state (x
     /// the invocations left, a float; y the next entry's address less 4; z 1) and its labels.
     std::vector<Quad> gs_entry_quads;
-    Quad gs_loop{};
+    Quad gs_loop{}; ///< gs_trails: w 0 the draw's first, 1 a head to check, -1 past the first
     int gs_loop_top = -1;
+    int gs_trail_exit = -1; ///< gs_trails: past the stores, the instance's end
     uint32_t gs_entry_words = 0;
     Reg GsWord(uint32_t k) const {
         if (!req.gs_serial) {
@@ -1884,6 +1885,11 @@ void VertexEmitter::EpilogueStreamOut() {
         e.MadI32(entry, Reg::V(static_cast<uint8_t>(gs_loop.base + 2)), 4, entry);
         e.Vec(VecOp::Add, {gs_loop.Pair(0), 0x1}, {ConstOne.reg, ConstOne.swz, Mod::Neg},
               {gs_loop.Pair(0), XYZW});
+        if (req.gs_trails) {
+            // Past the instance's first invocation: the next head ends it (w -1).
+            e.Vec(VecOp::Add, {gs_loop.Pair(1), 0x2}, {ConstOne.reg, ConstOne.swz, Mod::Neg},
+                  ConstZero);
+        }
         e.Test(Cond::Gt, 2, {gs_loop.Pair(0)}, 0, ConstZero, true);
         Branch(Pred::P2, gs_loop_top);
         for (uint32_t t = 0; t < 16; t++) {
@@ -1899,6 +1905,9 @@ void VertexEmitter::EpilogueStreamOut() {
         }
     } else {
         e.Sta32(GsWord(1), 0, Reg::V(static_cast<uint8_t>(gs_state.base + 2)), 0);
+    }
+    if (req.gs_trails) {
+        Bind(gs_trail_exit);
     }
     e.Idf(0);
     e.WdfVertex(0);
@@ -1981,6 +1990,20 @@ void VertexEmitter::Prologue() {
         const Reg entry = Reg::V(static_cast<uint8_t>(gs_loop.base + 1));
         gs_loop_top = NewLabel();
         e.MoveInternal({gs_loop.Pair(0), 0x1}, {Reg::Pa(0), XXXX});
+        if (req.gs_trails) {
+            // A negative count: an instance past the draw's first, which runs only from a head
+            // (w 1). Zero: a padding instance, nothing to run.
+            gs_trail_exit = NewLabel();
+            const int counted = NewLabel();
+            e.MoveInternal({gs_loop.Pair(1), 0x2}, ConstZero);
+            e.Test(Cond::Ge, 2, {gs_loop.Pair(0)}, 0, ConstZero, true);
+            Branch(Pred::P2, counted);
+            e.Vec(VecOp::Add, {gs_loop.Pair(1), 0x2}, ConstOne, ConstZero);
+            e.Vec(VecOp::Add, {gs_loop.Pair(0), 0x1}, {gs_loop.Pair(0), XYZW, Mod::Neg}, ConstZero);
+            Bind(counted);
+            e.Test(Cond::Eq, 2, {gs_loop.Pair(0)}, 0, ConstZero, true);
+            Branch(Pred::P2, gs_trail_exit);
+        }
         e.Bitwise(BwOp::Or, entry, IOp::R(Reg::Pa(1)), IOp::Imm(0));
         // z: the entry's words, mad.i32's multiplier for the entry's step (its first source is
         // no SA, and its immediate is signed, EpilogueStreamOut).
@@ -2037,6 +2060,24 @@ void VertexEmitter::Prologue() {
             // register allocator, never read as zero.
             e.MoveInternal({gs_emit.Pair(0), 0x3}, {Reg::C(0), XYZW});
             e.MoveInternal({gs_emit.Pair(1), 0x3}, {Reg::C(0), XYZW});
+        }
+        if (req.gs_trails) {
+            // Whether this invocation is a trail's head: the program's own opening CMP and its
+            // JMPC's condition (GsTrailHead), on the invocation's rows. An instance that must
+            // start at a head ends at an invocation that is none; one past its first ends at the
+            // next head, which an instance of its own runs. The main code runs the CMP again.
+            const Instruction jmp = {req.code[req.main_offset + 1]};
+            const int head = NewLabel();
+            const int go = NewLabel();
+            EmitInstruction(req.main_offset);
+            CondBranch(jmp.flow_control, head, true);
+            e.Test(Cond::Gt, 2, {gs_loop.Pair(1)}, 1, ConstZero, true);
+            Branch(Pred::P2, gs_trail_exit);
+            Branch(Pred::None, go);
+            Bind(head);
+            e.Test(Cond::Lt, 2, {gs_loop.Pair(1)}, 1, ConstZero, true);
+            Branch(Pred::P2, gs_trail_exit);
+            Bind(go);
         }
     }
 }
@@ -2419,6 +2460,43 @@ uint32_t GsTriangleBound(std::span<const uint32_t> code, uint32_t code_size, uin
     GsBoundWalk walk{code, std::min<uint32_t>(code_size, static_cast<uint32_t>(code.size()))};
     const uint32_t bound = walk.Range(main_offset, walk.extent, false, 0);
     return walk.bounded ? bound : 0;
+}
+
+bool GsTrailHead(std::span<const uint32_t> code, uint32_t code_size, uint32_t main_offset) {
+    const uint32_t extent = std::min<uint32_t>(code_size, static_cast<uint32_t>(code.size()));
+    if (main_offset + 1 >= extent) {
+        return false;
+    }
+    const Instruction cmp = {code[main_offset]};
+    const Instruction jmp = {code[main_offset + 1]};
+    if (cmp.opcode.Value().EffectiveOpCode() != OpCode::Id::CMP ||
+        jmp.opcode.Value() != OpCode::Id::JMPC) {
+        return false;
+    }
+    const uint32_t head = jmp.flow_control.dest_offset;
+    if (head <= main_offset + 1) {
+        return false;
+    }
+    for (uint32_t offset = head; offset < extent; offset++) {
+        const Instruction instr = {code[offset]};
+        const OpCode::Info info = instr.opcode.Value().GetInfo();
+        if (info.type == OpCode::Type::Arithmetic || info.type == OpCode::Type::MultiplyAdd) {
+            continue;
+        }
+        switch (instr.opcode.Value()) {
+        case OpCode::Id::END:
+            return true;
+        case OpCode::Id::NOP:
+        case OpCode::Id::IFC:
+        case OpCode::Id::IFU:
+            // An IF's two ranges are the code after it, in order: no way out of the block.
+            continue;
+        default:
+            // EMIT, SETEMIT, a call, a jump, a loop, a break: not a head block.
+            return false;
+        }
+    }
+    return false;
 }
 
 bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size) {
