@@ -71,6 +71,9 @@ enum class Option : u32 {
     /// Blended effects lit at their vertices (RasterizerSgxd::SetPvEffectLighting): 1, or 0 for
     /// every pixel lit.
     PvEffectLighting,
+    /// Geometry programs that read a temporary first run side by side, not in order
+    /// (RasterizerSgxd::SetParallelGeometry): 1, or 0 for in order.
+    ParallelGeometry,
     /// Upstream's simulate_3ds_gpu_timings: 1 delays GSP's interrupts by the delay generators'
     /// estimates of their work, 0 (upstream's default) raises them at once.
     SimulateGpuTimings,

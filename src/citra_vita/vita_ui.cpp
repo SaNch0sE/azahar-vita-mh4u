@@ -1883,6 +1883,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::ParallelGeometry,
+         Category::Patches,
+         Kind::Toggle,
+         Translatable("Parallel geometry"),
+         Translatable("Builds effect particles side by side instead of one after another. Much "
+                      "faster where effects pile up (a wyvern taking off); an effect that relies on "
+                      "the one before it could look wrong."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::SimulateGpuTimings,
          Category::Speed,
          Kind::Toggle,
@@ -3583,6 +3594,8 @@ Ui::Action Ui::DrawSettings() {
                                 ? Loader::TuningFastShadows
                             : rows[i].option == Config::Option::PvEffectLighting
                                 ? Loader::TuningPvEffectLighting
+                            : rows[i].option == Config::Option::ParallelGeometry
+                                ? Loader::TuningParallelGeometry
                                 : Loader::TuningHudScale;
             if ((Loader::TitleTuningOf(settings_program_id) & bit) != 0) {
                 DrawRow(rows[i], i);

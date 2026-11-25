@@ -2123,6 +2123,21 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          geo[2] - last_geo[2],
                                          SgxdRenderer::SgxdBackend::ToolsStreamRecipes());
                     last_geo = geo;
+                    // Pass A1's draws and invocations by how they ran: side by side, in order (a
+                    // program that reads a temporary first), side by side by the Parallel geometry
+                    // option.
+                    static std::array<u32, 6> last_order{};
+                    std::array<u32, 6> order{};
+                    for (int k = 0; k < 6; k++) {
+                        order[k] = SgxdRenderer::RasterizerSgxd::ToolsGeometryOrder(k);
+                    }
+                    sites += fmt::format("; geometry parallel {} draws {} invocations, serial {} "
+                                         "draws {} invocations, forced parallel {} draws {} "
+                                         "invocations",
+                                         order[0] - last_order[0], order[1] - last_order[1],
+                                         order[2] - last_order[2], order[3] - last_order[3],
+                                         order[4] - last_order[4], order[5] - last_order[5]);
+                    last_order = order;
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
                              sgxd_wait_us_take() / 1000, renders - last_renders, sites);

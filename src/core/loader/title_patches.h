@@ -82,6 +82,9 @@ enum TitleTuningBit : u32 {
     /// The Per-vertex effect lighting option applies (RasterizerSgxd::SetPvEffectLighting): offered
     /// where it has been tried.
     TuningPvEffectLighting = 1u << 6,
+    /// The Parallel geometry option applies (RasterizerSgxd::SetParallelGeometry): offered where
+    /// it has been tried.
+    TuningParallelGeometry = 1u << 7,
 };
 inline std::atomic<u32> title_tuning{0};
 /// The tuning bits a title's built-in patches ask for (a menu's: the title need not be running).

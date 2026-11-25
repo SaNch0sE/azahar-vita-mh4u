@@ -117,6 +117,10 @@ public:
     /// Tools builds' cpu line, since the start: geometry draws 0 queued with the pass, 1 sent
     /// alone for want of a triangle bound, 2 sent alone with a bound past the room.
     [[nodiscard]] static u32 ToolsGeometryDraws(int which);
+    /// Tools builds' cpu line, since the start: geometry draws (even `which`) and their invocations
+    /// (odd) by how pass A1 ran them: 0-1 in parallel, 2-3 in order (VsRequest::gs_serial), 4-5 in
+    /// parallel although the program reads a temporary first (the Parallel geometry option).
+    [[nodiscard]] static u32 ToolsGeometryOrder(int which);
 #endif
     /// The Fast shadows option: for a title with TuningFastShadows, a Shadow2D texture is read once
     /// through a linear filter and compared once (hard edges) rather than as four compared taps.
@@ -133,6 +137,16 @@ public:
     /// Whether eligible blended draws are lit at their vertices now (the option and the title's
     /// bit, or the diagnostics flag pveffect).
     [[nodiscard]] static bool PvEffectLighting();
+    /// The Parallel geometry option: for a title with TuningParallelGeometry, a geometry program
+    /// that reads a temporary before it writes it (Program::gs_temps_read_first) still runs its
+    /// invocations side by side, each starting those temporaries at (0, 0, 0, 1) as the parallel
+    /// form starts them, rather than in order in one instance with the temporaries carried from
+    /// each invocation to the next (VsRequest::gs_serial). Any thread; draws after it changes
+    /// take it.
+    static void SetParallelGeometry(bool on);
+    /// Whether such geometry programs run side by side now (the option and the title's bit, or the
+    /// diagnostics flag parallelgs).
+    [[nodiscard]] static bool ParallelGeometry();
     /// What applies now: SetHudScale's for a title with the tuning, else 4.
     [[nodiscard]] static u32 HudScale();
     /// Whether the top screen's 2D layer is drawn at the HUD scale now: one above the internal
@@ -670,9 +684,13 @@ private:
                                      u64 emit_us = 0);
     /// The geometry program for `rows` input rows and at most `max_triangles` triangles an invocation;
     /// `input_rows`: the fixed-primitive mode's registers that read rows of their own.
+    /// `forced_parallel`: a program that reads a temporary first, run side by side anyway (the
+    /// Parallel geometry option; `serial` false). Its code is the parallel form's, but its key is
+    /// its own, so the variant the option asked for is never taken for another.
     const VertexProgram& GeometryProgramFor(u32 rows, bool rows_uniform, bool rows_table,
                                             u32 first_uniform, u16 input_rows, u32 max_triangles,
-                                            bool serial, const Describe& describe);
+                                            bool serial, bool forced_parallel,
+                                            const Describe& describe);
     /// A geometry program's key, and the bool registers it reads with their values (setup's).
     struct GeometryKey {
         u64 key;
@@ -680,15 +698,18 @@ private:
         u16 used;
         bool uniform_table; ///< Usse::VsRequest::gs_uniform_table
     };
+    /// `forced_parallel` sets a key bit of its own, only when true: the other keys are unchanged.
     GeometryKey GeometryKeyFor(u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
-                               u16 input_rows, u32 max_triangles, bool serial);
+                               u16 input_rows, u32 max_triangles, bool serial,
+                               bool forced_parallel);
     Usse::VsRequest GeometryRequest(const GeometryKey& k, u32 rows, bool rows_uniform,
                                     bool rows_table, u32 first_uniform, u16 input_rows,
                                     u32 max_triangles, bool serial) const;
     /// A new geometry draw's second program (b15 true) on the first tier's worker while this thread
     /// emits the first, when neither is placed or cached and they differ.
     void QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
-                           u16 input_rows, u32 max_triangles, bool serial, bool b15);
+                           u16 input_rows, u32 max_triangles, bool serial,
+                           bool forced_parallel, bool b15);
     const VertexProgram& MakeGeometryProgram(const GeometryKey& k, u32 rows, bool rows_uniform,
                                              bool rows_table, u32 first_uniform, u16 input_rows,
                                              u32 max_triangles, bool serial,

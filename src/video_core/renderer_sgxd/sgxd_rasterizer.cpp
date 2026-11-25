@@ -985,6 +985,26 @@ bool RasterizerSgxd::PvEffectLighting() {
            Loader::TitleTuned(Loader::TuningPvEffectLighting);
 }
 
+namespace {
+std::atomic<bool> parallel_geometry{false};
+} // Anonymous namespace
+
+void RasterizerSgxd::SetParallelGeometry(bool on) {
+    parallel_geometry.store(on, std::memory_order_relaxed);
+}
+
+bool RasterizerSgxd::ParallelGeometry() {
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags parallelgs: the same for any title.
+    static const bool flag = SgxdFlag("parallelgs");
+    if (flag) {
+        return true;
+    }
+#endif
+    return parallel_geometry.load(std::memory_order_relaxed) &&
+           Loader::TitleTuned(Loader::TuningParallelGeometry);
+}
+
 u32 RasterizerSgxd::PvEffectRequest(bool blend) {
     // Blended draws alone, through the ordinary vertex program (a geometry shader's triangles come
     // from the stream-out renders, which make no TEXCOORD4): opaque surfaces keep their per-pixel
@@ -4791,7 +4811,7 @@ RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program u
 RasterizerSgxd::GeometryKey RasterizerSgxd::GeometryKeyFor(u32 rows, bool rows_uniform,
                                                            bool rows_table, u32 first_uniform,
                                                            u16 input_rows, u32 max_triangles,
-                                                           bool serial) {
+                                                           bool serial, bool forced_parallel) {
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.DoProgramCodeFixup();
     const u64 program_hash = setup.GetProgramCodeHash();
@@ -4806,15 +4826,16 @@ RasterizerSgxd::GeometryKey RasterizerSgxd::GeometryKeyFor(u32 rows, bool rows_u
     const bool uniform_table = GsUniformTable(rows_uniform, rows_table);
     const u32 output_mask = regs.gs.output_mask;
     // Every field through a combine: a bit XORed onto the result's top bit would undo a bool at the
-    // top of the argument before it.
+    // top of the argument before it. The forced-parallel bit is above the others and zero unless
+    // the Parallel geometry option forced it, so every key without it is as it was before it.
     const u64 key = Common::HashCombine(
         Common::HashCombine(program_hash, setup.GetSwizzleDataHash()),
         static_cast<u64>(regs.gs.main_offset.Value()) << 16 | output_mask,
         static_cast<u64>(bools) << 48 | static_cast<u64>(used) << 32 |
             static_cast<u64>(max_triangles) << 16 | (rows_table ? 0x8000u : 0u) |
             first_uniform << 8 | (rows_uniform ? 0x80u : 0u) | rows,
-        (uniform_table ? 1ull << 17 : 0ull) | static_cast<u64>(input_rows) << 1 |
-            (serial ? 1u : 0u));
+        (forced_parallel ? 1ull << 18 : 0ull) | (uniform_table ? 1ull << 17 : 0ull) |
+            static_cast<u64>(input_rows) << 1 | (serial ? 1u : 0u));
     return {key, bools, used, uniform_table};
 }
 
@@ -4850,9 +4871,9 @@ Usse::VsRequest RasterizerSgxd::GeometryRequest(const GeometryKey& k, u32 rows, 
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform, u16 input_rows,
-    u32 max_triangles, bool serial, const Describe& describe) {
+    u32 max_triangles, bool serial, bool forced_parallel, const Describe& describe) {
     const GeometryKey k = GeometryKeyFor(rows, rows_uniform, rows_table, first_uniform, input_rows,
-                                         max_triangles, serial);
+                                         max_triangles, serial, forced_parallel);
     const VertexProgram* const found = vertex_programs.Find(k.key);
     return found ? *found
                  : MakeGeometryProgram(k, rows, rows_uniform, rows_table, first_uniform, input_rows,
@@ -4861,14 +4882,14 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
 
 void RasterizerSgxd::QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_table,
                                        u32 first_uniform, u16 input_rows, u32 max_triangles,
-                                       bool serial, bool b15) {
+                                       bool serial, bool forced_parallel, bool b15) {
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.uniforms.b[15] = b15;
     const GeometryKey first = GeometryKeyFor(rows, rows_uniform, rows_table, first_uniform,
-                                             input_rows, max_triangles, serial);
+                                             input_rows, max_triangles, serial, forced_parallel);
     setup.uniforms.b[15] = true;
     const GeometryKey rest = GeometryKeyFor(rows, rows_uniform, rows_table, first_uniform,
-                                            input_rows, max_triangles, serial);
+                                            input_rows, max_triangles, serial, forced_parallel);
     disk_cache.Open(title_id);
     if (first.key == rest.key || vertex_programs.Find(first.key) != nullptr ||
         vertex_programs.Find(rest.key) != nullptr || disk_cache.Contains(first.key, true) ||
@@ -4996,10 +5017,15 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
 #if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
 namespace {
 std::array<std::atomic<u32>, 3> tools_geometry{};
+std::array<std::atomic<u32>, 6> tools_geometry_order{};
 } // Anonymous namespace
 
 u32 RasterizerSgxd::ToolsGeometryDraws(int which) {
     return tools_geometry[which].load(std::memory_order_relaxed);
+}
+
+u32 RasterizerSgxd::ToolsGeometryOrder(int which) {
+    return tools_geometry_order[which].load(std::memory_order_relaxed);
 }
 #endif
 
@@ -5315,21 +5341,32 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     u16 input_rows = 0;
     // A program that reads a temporary before it writes it runs its invocations in order, the
     // temporaries kept from each to the next and from the draw before, as the PICA's unit keeps them.
+    // The Parallel geometry option runs it side by side all the same (forced_parallel): each
+    // invocation starts those temporaries at (0, 0, 0, 1), as the parallel form starts them, and its
+    // emit buffer's vertices unset (the parallel form's), so an effect that counts on what the
+    // invocation before it left loses that.
     bool serial = false;
+    bool forced_parallel = false;
     const auto programs = [&] {
         // A new draw's two programs at once: the second on the first tier's worker.
         QueueGeometryPair(rows, rows_uniform, rows_table, first_uniform, input_rows, cap, serial,
-                          b15);
+                          forced_parallel, b15);
         pica.gs_setup.uniforms.b[15] = b15;
         first_program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform,
-                                            input_rows, cap, serial, describe);
+                                            input_rows, cap, serial, forced_parallel, describe);
         pica.gs_setup.uniforms.b[15] = true;
         program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform, input_rows,
-                                      cap, serial, describe);
+                                      cap, serial, forced_parallel, describe);
     };
     programs();
-    if (!serial && (first_program->usse.gs_temps_read_first | program->usse.gs_temps_read_first)) {
-        serial = true;
+    const u16 temps_read_first = static_cast<u16>(first_program->usse.gs_temps_read_first |
+                                                  program->usse.gs_temps_read_first);
+    if (temps_read_first != 0) {
+        if (ParallelGeometry()) {
+            forced_parallel = true;
+        } else {
+            serial = true;
+        }
         programs();
     }
     // The unit keeps its input registers between draws: one the draw does not load holds the row an
@@ -5349,6 +5386,35 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         rows = static_cast<u32>(std::bit_width(stale));
         programs();
     }
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // Tools builds' cpu line: the draws and invocations pass A1 runs side by side, in order, and
+    // side by side by the option's leave; each program that reads a temporary first is logged
+    // once with the temporaries it reads first and how it ran.
+    {
+        const int order = serial ? 2 : forced_parallel ? 4 : 0;
+        tools_geometry_order[order].fetch_add(1, std::memory_order_relaxed);
+        tools_geometry_order[order + 1].fetch_add(invocations, std::memory_order_relaxed);
+        if (temps_read_first != 0) {
+            static std::array<u64, 32> told{};
+            static u32 told_count = 0;
+            const u64 gs_key = Common::HashCombine(pica.gs_setup.GetProgramCodeHash(),
+                                                   regs.gs.main_offset.Value());
+            if (told_count < told.size() &&
+                std::find(told.begin(), told.begin() + told_count, gs_key) ==
+                    told.begin() + told_count) {
+                told[told_count++] = gs_key;
+                LOG_INFO(Render,
+                         "geometry: program {:016x} reads temporaries {:#06x} before it writes "
+                         "them (first invocation {:#06x}, the rest {:#06x}): runs {}; {} "
+                         "invocations, mode {}, rows {}, bound {}",
+                         gs_key, temps_read_first, first_program->usse.gs_temps_read_first,
+                         program->usse.gs_temps_read_first,
+                         serial ? "in order" : "side by side (Parallel geometry)", invocations,
+                         static_cast<u32>(pipeline.gs_config.mode.Value()), rows, bound);
+            }
+        }
+    }
+#endif
     // A row an earlier draw left in its own memory is gone with its pass.
     ASSERT_MSG((stale & gs_rows_own) == 0,
                "sgxd: {}: a geometry program reads input registers {:#x} an earlier draw left in "

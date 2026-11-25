@@ -278,12 +278,16 @@ constexpr std::array table{std::to_array<Translation>({
     {"Even frame pacing (experimental)", "均匀帧节奏（实验性）"},
     {"Fast shadows", "快速阴影"},
     {"Speed options", "速度选项"},
-    {"Offers the Fast shadows and Per-vertex effect lighting options for this game. It changes "
-     "nothing by itself.",
-     "为此游戏提供快速阴影和逐顶点特效光照选项。它本身不改变任何内容。"},
+    {"Offers the Fast shadows, Per-vertex effect lighting and Parallel geometry options for this "
+     "game. It changes nothing by itself.",
+     "为此游戏提供快速阴影、逐顶点特效光照和并行几何选项。它本身不改变任何内容。"},
     {"Reads the game's shadow map once per pixel instead of four times. Shadows stay in place but get hard, stepped edges; the GPU does less at every lit pixel in shadowed scenes, about 15% of the 3D picture in a Monster Hunter 4 Ultimate field.",
      "每个像素只读取一次游戏的阴影贴图，而不是四次。阴影位置不变，但边缘变硬、呈阶梯状；在有阴影的场景中，GPU 在每个受光像素上的工作量减少，在《怪物猎人4 终极版》的野外约占 3D 画面的 15%。"},
     {"Per-vertex effect lighting", "逐顶点特效光照"},
+    {"Parallel geometry", "并行几何"},
+    {"Builds effect particles side by side instead of one after another. Much faster where effects "
+     "pile up (a wyvern taking off); an effect that relies on the one before it could look wrong.",
+     "同时构建特效粒子，而不是逐个构建。在特效大量叠加时（如飞龙起飞）快得多；依赖前一个粒子的特效可能显示异常。"},
     {"Lights blended effects such as mist and smoke at their corners instead of at every pixel. They may look slightly different; the GPU does much less work when such effects cover the screen.",
      "在半透明特效（如雾气和烟尘）的顶点处计算光照，而不是在每个像素上计算。它们看起来可能略有不同；当这类特效覆盖屏幕时，GPU 的工作量会大大减少。"},
     {"Experimental. Shows the game's pictures at an even beat of two refreshes: one that is ready "
