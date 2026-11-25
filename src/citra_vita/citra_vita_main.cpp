@@ -2069,6 +2069,31 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              speed_percent.load(std::memory_order_relaxed), g10 / 10, g10 % 10,
                              shown - last_shown, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
                              p[8], p[9], p[10], p[11], f[0], f[1], f[2], f[3]);
+                    // The CPU time each thread ran in the interval (its own run clock): which one
+                    // runs out of time when the game slows down.
+                    static u64 last_emu = 0, last_render = 0, last_parse = 0;
+                    SceKernelThreadInfo self{};
+                    self.size = sizeof(self);
+                    const u64 emu = sceKernelGetThreadInfo(sceKernelGetThreadId(), &self) >= 0
+                                        ? static_cast<u64>(self.runClocks)
+                                        : last_emu;
+                    const u64 render = SgxdRenderer::RenderThread::ToolsRunUs(0);
+                    const u64 parse = SgxdRenderer::RenderThread::ToolsRunUs(1);
+                    static std::array<u64, 3> last_wait{};
+                    std::array<u64, 3> wait{};
+                    for (int k = 0; k < 3; k++) {
+                        wait[k] = SgxdRenderer::RenderThread::ToolsEmuWaitUs(k);
+                    }
+                    LOG_INFO(Frontend,
+                             "cpu: emulation {} ms, render {} ms, parse {} ms; emulation asleep for "
+                             "the render thread: ticket {} ms, ring space {} ms, sync {} ms",
+                             (emu - last_emu) / 1000, (render - last_render) / 1000,
+                             (parse - last_parse) / 1000, (wait[0] - last_wait[0]) / 1000,
+                             (wait[1] - last_wait[1]) / 1000, (wait[2] - last_wait[2]) / 1000);
+                    last_wait = wait;
+                    last_emu = emu;
+                    last_render = render;
+                    last_parse = parse;
                 }
 #endif
                 last_shown = shown;

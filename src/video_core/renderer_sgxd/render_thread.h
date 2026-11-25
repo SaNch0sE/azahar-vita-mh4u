@@ -84,6 +84,14 @@ public:
     /// The presents' gaps since the last call at three stages (handed over by the emulation,
     /// reached by the render thread, shown), four spans each: to 20 ms, to 37, to 54, longer.
     [[nodiscard]] static std::array<u32, 12> TakePaceGaps();
+#ifdef VITA_DEBUG_TOOLS
+    /// Tools builds' cpu line: the CPU time the render (0) and parse (1) threads have run, in
+    /// microseconds, as each last read it of itself (a thread reading another's info stops it).
+    [[nodiscard]] static u64 ToolsRunUs(int which);
+    /// Tools builds' cpu line: the emulation side's time asleep for the render thread, by EmuWait
+    /// kind (ticket, ring space, sync), in microseconds since the start.
+    [[nodiscard]] static u64 ToolsEmuWaitUs(int kind);
+#endif
 #endif
     static void SetReadbackHolds(bool on);
     [[nodiscard]] static u32 MaxScreenSkips();

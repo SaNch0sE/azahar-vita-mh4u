@@ -2239,9 +2239,42 @@ void RenderThread::ParseRecord(const Head& head, const u8* p) {
     }
 }
 
+#ifdef VITA_DEBUG_TOOLS
+namespace {
+std::array<std::atomic<u64>, 2> tools_run_us{};
+/// The emulation side's sleeps for the render thread, by RenderThread::EmuWait.
+std::array<std::atomic<u64>, 3> tools_emu_wait_us{};
+/// The calling thread's own run time, read four times a second at most (a syscall).
+void NoteRunTime(int which) {
+    thread_local u64 last_note = 0;
+    const u64 now = sceKernelGetProcessTimeWide();
+    if (now - last_note < 250000) {
+        return;
+    }
+    last_note = now;
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) >= 0) {
+        tools_run_us[which].store(static_cast<u64>(info.runClocks), std::memory_order_relaxed);
+    }
+}
+} // Anonymous namespace
+
+u64 RenderThread::ToolsRunUs(int which) {
+    return tools_run_us[which].load(std::memory_order_relaxed);
+}
+
+u64 RenderThread::ToolsEmuWaitUs(int kind) {
+    return tools_emu_wait_us[kind].load(std::memory_order_relaxed);
+}
+#endif
+
 void RenderThread::ParseLoop() {
     Common::SetCurrentThreadRole(Common::ThreadRole::Parse);
     for (;;) {
+#ifdef VITA_DEBUG_TOOLS
+        NoteRunTime(1);
+#endif
         u32 r = parse_read.load(std::memory_order_relaxed);
         if (r == published.load()) {
             if (parse_stopping.load()) {
@@ -3337,6 +3370,11 @@ void RenderThread::SleepDone([[maybe_unused]] EmuWait kind) {
     if (!done.WaitFor(std::chrono::milliseconds(1))) {
         c.timeouts.fetch_add(1, std::memory_order_relaxed);
     }
+#elif defined(VITA_DEBUG_TOOLS)
+    const u64 start = sceKernelGetProcessTimeWide();
+    done.WaitFor(std::chrono::milliseconds(1));
+    tools_emu_wait_us[kind].fetch_add(sceKernelGetProcessTimeWide() - start,
+                                      std::memory_order_relaxed);
 #else
     done.WaitFor(std::chrono::milliseconds(1));
 #endif
@@ -4514,6 +4552,9 @@ void RenderThread::Loop() {
     u32 progress = 0;
     auto progress_at = Clock::now();
     for (;;) {
+#ifdef VITA_DEBUG_TOOLS
+        NoteRunTime(0);
+#endif
         ServeGuestAccesses();
         RunAvailable();
         PollFences();
