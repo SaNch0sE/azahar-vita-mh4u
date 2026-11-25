@@ -168,6 +168,9 @@ private:
     std::unique_ptr<std::atomic<u32>[]> last_use;
     std::atomic<u32> frame{};
     u32 next_stale_look{64}; ///< EndFrame's next look for stale pages (the emulation thread's)
+    /// ReturnStale left stale pages for the next vblank (a title keeping its moved pages returns
+    /// StaleReturnPages at a time).
+    std::atomic<bool> stale_more{false};
 #ifdef VITA_DIAGNOSTICS
     MoveStats stats{};
     /// The last return's FCRAM pages (EvictPool, ReturnStale), its frame and its kind.

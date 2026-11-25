@@ -34,6 +34,11 @@ constexpr u32 PageSize = 0x1000;
 constexpr u32 PoolSize = 8 * 1024 * 1024;
 constexpr u32 GrowSize = 1024 * 1024;
 constexpr u32 MaxPoolSize = 32 * 1024 * 1024;
+// A title keeping its moved pages returns stale ones this many at a time (256 KiB), one return a
+// vblank that finds the render thread caught up: the pages a load moved go stale together, and
+// returning them all at once (copies, cache cleans, waits for the GPU's writes) stopped the game
+// for 166-174 ms (Monster Hunter XX, 17 s after a load: 944 pages); 128 took ~24 ms each.
+constexpr std::size_t StaleReturnPages = 64;
 // A pool short of free pages puts back the pages no GPU use stamped for a second (at vblank).
 constexpr u32 IdleFrames = 60;
 constexpr u32 MaxPagesPerMove = 256;
@@ -267,6 +272,11 @@ bool GuestGpuMemory::EndFrame(bool render_idle) {
     // frame or more in a busy scene (Monster Hunter 4 Ultimate's fights stuttered, 11 to 160 ms).
     // A title tuned to keep its moved pages looks at the first vblank past the 64 frames that
     // finds the render thread with nothing queued, where the return costs its copy alone.
+    // More stale pages left by the last return: the next caught-up vblank goes on with them.
+    if (Loader::TitleTuned(Loader::TuningKeepMovedPages) && render_idle &&
+        stale_more.load(std::memory_order_relaxed)) {
+        return true;
+    }
     if (now - next_stale_look >= 0x80000000u) {
         return false;
     }
@@ -399,9 +409,18 @@ void GuestGpuMemory::ReturnStale() {
         }
     }
     if (stale.empty()) {
+        stale_more.store(false, std::memory_order_relaxed);
         return;
     }
     std::sort(stale.begin(), stale.end());
+    // A title keeping its moved pages: StaleReturnPages now, the rest at the next caught-up
+    // vblanks (EndFrame).
+    const bool capped = Loader::TitleTuned(Loader::TuningKeepMovedPages) &&
+                        stale.size() > StaleReturnPages;
+    if (capped) {
+        stale.resize(StaleReturnPages);
+    }
+    stale_more.store(capped, std::memory_order_relaxed);
 #ifdef VITA_DIAGNOSTICS
     NoteReturn(stale, "stale");
 #endif
