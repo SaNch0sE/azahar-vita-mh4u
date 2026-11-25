@@ -81,8 +81,8 @@ uint32_t sgxd_sync_submits, sgxd_kicks;
 int sgxd_ptla_idle(void);
 
 // The caller's time spun waiting for the GPU (sgxd_wait_us_take); counted in the diagnostics
-// build only.
-#ifdef VITA_DIAGNOSTICS
+// and tools builds only.
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
 static uint32_t wait_us;
 static uint64_t wait_us_total;
 
@@ -188,7 +188,7 @@ int sgxd_ptla_idle(void) {
             return -1;
         }
     }
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
     sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
 #endif
     return 0;
@@ -350,7 +350,7 @@ int sgxd_chain_wait(uint32_t fence) {
             return -1;
         }
     }
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
     sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
 #endif
     return 0;
@@ -406,7 +406,7 @@ int sgxd_chain_sleep_until(uint32_t fence, int32_t flag, uint32_t bits, uint64_t
             return -1;
         }
     }
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
     sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - start));
 #else
     (void)start;

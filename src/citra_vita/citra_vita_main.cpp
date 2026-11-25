@@ -64,6 +64,7 @@
 #include "core/memory.h"
 #include "sgxd_mkq.h"
 #include "sgxd_ptla.h"
+#include "sgxd_session.h"
 #include "video_core/renderer_sgxd/vprof.h"
 
 #include <cstdio>
@@ -2091,6 +2092,30 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              (parse - last_parse) / 1000, (wait[0] - last_wait[0]) / 1000,
                              (wait[1] - last_wait[1]) / 1000, (wait[2] - last_wait[2]) / 1000);
                     last_wait = wait;
+                    static std::array<u64, 5> last_rc{};
+                    std::array<u64, 5> rc{};
+                    for (int k = 0; k < 5; k++) {
+                        rc[k] = SgxdRenderer::RenderThread::ToolsRenderCounter(k);
+                    }
+                    const u64 draws = rc[1] - last_rc[1];
+                    LOG_INFO(Frontend,
+                             "cpu: render thread running records {} ms; {} draws in {} ms ({} us "
+                             "each); asleep for the GPU {} ms, for records {} ms",
+                             (rc[0] - last_rc[0]) / 1000, draws, (rc[2] - last_rc[2]) / 1000,
+                             draws != 0 ? (rc[2] - last_rc[2]) / draws : 0,
+                             (rc[3] - last_rc[3]) / 1000, (rc[4] - last_rc[4]) / 1000);
+                    last_rc = rc;
+                    static u32 last_renders = 0;
+                    const u32 renders = sgxd_session_renders();
+#ifdef VITA_DIAGNOSTICS
+                    // perflog has them by site.
+                    const std::string sites;
+#else
+                    const std::string sites = SgxdRenderer::SgxdBackend::ToolsWaitSites();
+#endif
+                    LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
+                             sgxd_wait_us_take() / 1000, renders - last_renders, sites);
+                    last_renders = renders;
                     last_emu = emu;
                     last_render = render;
                     last_parse = parse;

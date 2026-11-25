@@ -161,7 +161,7 @@ int sgxd_slc_invalidate(void);
 // first when the op touches the 3D's memory.
 void sgxd_set_render_drain(int (*drain)(void));
 
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
 // The time the app's threads spun waiting for the GPU: the idle waits above and a synchronous
 // render's TA and 3D waits, in the diagnostics build only. Take returns it and starts again.
 void sgxd_wait_us_add(uint32_t us);

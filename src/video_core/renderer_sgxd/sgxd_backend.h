@@ -1153,6 +1153,13 @@ private:
 #endif
     void WaitSite(const char* site, u64 before);
 
+public:
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    /// Tools builds' cpu line: the render thread's GPU waits by site since the last call.
+    [[nodiscard]] static std::string ToolsWaitSites();
+#endif
+private:
+
     bool blit_ready{};
     u32 blit_vertex{}, blit_fragment{}, untile_fragment{}, merge_vertex{}, merge_fragment{};
     u32 raw64_fragment{}, keep_fragment{};

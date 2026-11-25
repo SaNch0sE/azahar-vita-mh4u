@@ -120,12 +120,22 @@ void SgxdDrainKernelLog() {
 namespace {
 
 u64 WaitMark() {
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
     return sgxd_wait_us_total();
 #else
     return 0;
 #endif
 }
+
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+// Tools builds' cpu line: the GPU waits by site (SgxdBackend::WaitSite), the render thread's alone.
+struct ToolsWaitSite {
+    std::atomic<const char*> site{};
+    std::atomic<u64> us{};
+    std::atomic<u32> count{};
+};
+std::array<ToolsWaitSite, 16> tools_wait_sites{};
+#endif
 
 // GPU address map: docs/sgxd/memory.md.
 constexpr u32 BlockVa = 0x04000000;
@@ -2539,8 +2549,44 @@ void SgxdBackend::WaitSite([[maybe_unused]] const char* site, [[maybe_unused]] u
         v.first++;
         v.second += us;
     }
+#elif defined(VITA_DEBUG_TOOLS)
+    const u64 us = sgxd_wait_us_total() - before;
+    for (ToolsWaitSite& t : tools_wait_sites) {
+        const char* const held = t.site.load(std::memory_order_relaxed);
+        if (held == site || held == nullptr) {
+            if (held == nullptr) {
+                t.site.store(site, std::memory_order_relaxed);
+            }
+            t.us.fetch_add(us, std::memory_order_relaxed);
+            t.count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
 #endif
 }
+
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+std::string SgxdBackend::ToolsWaitSites() {
+    static std::array<u64, 16> last_us{};
+    static std::array<u32, 16> last_count{};
+    std::string out;
+    for (std::size_t i = 0; i < tools_wait_sites.size(); i++) {
+        const char* const site = tools_wait_sites[i].site.load(std::memory_order_relaxed);
+        if (site == nullptr) {
+            break;
+        }
+        const u64 us = tools_wait_sites[i].us.load(std::memory_order_relaxed);
+        const u32 count = tools_wait_sites[i].count.load(std::memory_order_relaxed);
+        if (count != last_count[i]) {
+            out += fmt::format("; {}: {} ms in {}", site, (us - last_us[i]) / 1000,
+                               count - last_count[i]);
+        }
+        last_us[i] = us;
+        last_count[i] = count;
+    }
+    return out;
+}
+#endif
 
 void SgxdBackend::RenderAsync(Recipe& r, const u32 touches[6]) {
     char failed[200] = "";

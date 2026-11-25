@@ -91,6 +91,9 @@ public:
     /// Tools builds' cpu line: the emulation side's time asleep for the render thread, by EmuWait
     /// kind (ticket, ring space, sync), in microseconds since the start.
     [[nodiscard]] static u64 ToolsEmuWaitUs(int kind);
+    /// Tools builds' cpu line, since the start: 0 the time running records (us), 1 the draws run, 2
+    /// their time (us), 3 asleep waiting for the GPU (us), 4 asleep waiting for records (us).
+    [[nodiscard]] static u64 ToolsRenderCounter(int which);
 #endif
 #endif
     static void SetReadbackHolds(bool on);

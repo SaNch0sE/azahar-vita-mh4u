@@ -172,8 +172,17 @@ static uint64_t spin_until(uint32_t bit) {
 }
 #endif
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+// Tools builds: each synchronous render's time from its kick to its 3D's end (the caller waits all
+// of it), in the GPU wait counter (sgxd_wait_us_take).
+static uint64_t tools_render_start;
+#endif
+
 int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *failed,
                         unsigned failed_size) {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_render_start = sceKernelGetProcessTimeWide();
+#endif
     if (sgxd_session_phase(r, sgxd_recipe_ta_kick, "ta kick", failed, failed_size) < 0) {
         return -1;
     }
@@ -214,6 +223,9 @@ int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *fa
 #else
     render->ta_us = 0;
     render->d3_us = 0;
+#ifdef VITA_DEBUG_TOOLS
+    sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - tools_render_start));
+#endif
 #endif
     return 0;
 }

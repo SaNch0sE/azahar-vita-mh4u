@@ -2244,6 +2244,8 @@ namespace {
 std::array<std::atomic<u64>, 2> tools_run_us{};
 /// The emulation side's sleeps for the render thread, by RenderThread::EmuWait.
 std::array<std::atomic<u64>, 3> tools_emu_wait_us{};
+/// The render thread's work: RenderThread::ToolsRenderCounter's indices.
+std::array<std::atomic<u64>, 5> tools_render{};
 /// The calling thread's own run time, read four times a second at most (a syscall).
 void NoteRunTime(int which) {
     thread_local u64 last_note = 0;
@@ -2266,6 +2268,10 @@ u64 RenderThread::ToolsRunUs(int which) {
 
 u64 RenderThread::ToolsEmuWaitUs(int kind) {
     return tools_emu_wait_us[kind].load(std::memory_order_relaxed);
+}
+
+u64 RenderThread::ToolsRenderCounter(int which) {
+    return tools_render[which].load(std::memory_order_relaxed);
 }
 #endif
 
@@ -2385,7 +2391,19 @@ void RenderThread::RunParsed(u32 seq) {
                              seq, ended);
             end = true;
         } else if (head.op != Op::Wrap) {
+#ifdef VITA_DEBUG_TOOLS
+            const bool tools_draw = head.op == Op::Draw || head.op == Op::MergedDraw ||
+                                    head.op == Op::DrawTriangles;
+            const u64 tools_start = tools_draw ? sceKernelGetProcessTimeWide() : 0;
+#endif
             RunRecord(head, p + sizeof(Head));
+#ifdef VITA_DEBUG_TOOLS
+            if (tools_draw) {
+                tools_render[1].fetch_add(1, std::memory_order_relaxed);
+                tools_render[2].fetch_add(sceKernelGetProcessTimeWide() - tools_start,
+                                          std::memory_order_relaxed);
+            }
+#endif
 #ifdef VITA_DIAGNOSTICS
             records[KindOf(head.op)].fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -3974,6 +3992,9 @@ void RenderThread::RunAvailable() {
         return;
     }
     running_available = true;
+#ifdef VITA_DEBUG_TOOLS
+    const u64 tools_busy_start = sceKernelGetProcessTimeWide();
+#endif
 #ifdef VITA_DIAGNOSTICS
     // Counted as it goes, or a loop that never runs dry would show no time in perflog.
     auto start = Clock::now();
@@ -3989,7 +4010,19 @@ void RenderThread::RunAvailable() {
         std::memcpy(&head, p, sizeof(head));
         if (head.op != Op::Wrap) {
             running_op.store(static_cast<u32>(head.op), std::memory_order_relaxed);
+#ifdef VITA_DEBUG_TOOLS
+            const bool tools_draw = head.op == Op::Draw || head.op == Op::MergedDraw ||
+                                    head.op == Op::DrawTriangles;
+            const u64 tools_start = tools_draw ? sceKernelGetProcessTimeWide() : 0;
+#endif
             RunRecord(head, p + sizeof(Head));
+#ifdef VITA_DEBUG_TOOLS
+            if (tools_draw) {
+                tools_render[1].fetch_add(1, std::memory_order_relaxed);
+                tools_render[2].fetch_add(sceKernelGetProcessTimeWide() - tools_start,
+                                          std::memory_order_relaxed);
+            }
+#endif
             running_op.store(NoRecord, std::memory_order_relaxed);
 #ifdef VITA_DIAGNOSTICS
             records[KindOf(head.op)].fetch_add(1, std::memory_order_relaxed);
@@ -4027,6 +4060,10 @@ void RenderThread::RunAvailable() {
     }
 #ifdef VITA_DIAGNOSTICS
     busy_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
+#ifdef VITA_DEBUG_TOOLS
+    tools_render[0].fetch_add(sceKernelGetProcessTimeWide() - tools_busy_start,
+                              std::memory_order_relaxed);
 #endif
     running_available = false;
 }
@@ -4638,7 +4675,16 @@ void RenderThread::Loop() {
                 if (const s64 due_in = renderer.FlipDueIn(); due_in > 0) {
                     sleep = std::min(sleep, std::chrono::microseconds(std::max<s64>(due_in, 500)));
                 }
+#ifdef VITA_DEBUG_TOOLS
+                const u64 tools_sleep_start = sceKernelGetProcessTimeWide();
+#endif
                 [[maybe_unused]] const bool woken = Sleep(sleep);
+#ifdef VITA_DEBUG_TOOLS
+                // Asleep with GPU work pending (a ticket's or the flip's): waiting for the GPU;
+                // else for records.
+                tools_render[waiting ? 3 : 4].fetch_add(
+                    sceKernelGetProcessTimeWide() - tools_sleep_start, std::memory_order_relaxed);
+#endif
                 work.lock();
                 if (waiting) {
                     rasterizer.InterruptDisarm();
