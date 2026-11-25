@@ -5655,6 +5655,10 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
                 light.geometric_factor_1.Assign(0);
             }
         }
+        // 128: the bump map left out (the normal the vertices' own).
+        if (lite & 128) {
+            lighting.bump_mode.Assign(Pica::LightingRegs::LightingBumpMode::None);
+        }
 #endif
     }
     // Per-vertex effect lighting: the draw's vertex program lit it (draw_pv_effect, which
@@ -9049,6 +9053,43 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                  static_cast<u32>(om.alpha_blending.factor_dest_a.Value()), mask, draw_own_pixel,
                  dcmp, dwrite, fb.GetColorBufferPhysicalAddress(), fb.GetWidth(),
                  fb.GetHeight());
+        // drawkeys with fsonly=N: the PICA state behind those programs, once each (what their
+        // words do).
+        static const std::vector<u32> cfg_keys = SgxdFlagValues("fsonly");
+        static std::vector<u32> cfg_told;
+        const u32 low = static_cast<u32>(last_fragment_key);
+        if (std::find(cfg_keys.begin(), cfg_keys.end(), low) != cfg_keys.end() &&
+            std::find(cfg_told.begin(), cfg_told.end(), low) == cfg_told.end()) {
+            cfg_told.push_back(low);
+            const auto fc = FragmentConfig();
+            const auto& lt = fc.lighting;
+            std::string lights;
+            for (u32 i = 0; i < lt.src_num; i++) {
+                lights += fmt::format(" {:04x}", lt.lights[i].raw);
+            }
+            std::string stages;
+            for (const auto& st : regs.texturing.GetTevStages()) {
+                stages += fmt::format(" [{:08x} {:08x} {:08x} {:08x}]", st.sources_raw,
+                                      st.modifiers_raw, st.ops_raw, st.scales_raw);
+            }
+            LOG_INFO(Render,
+                     "perf: drawkey config {:016x}: u8 {}, lighting {:08x} (src {} config {} bump "
+                     "{} sel {} renorm {}), luts d0 {:08x} d1 {:08x} sp {:08x} fr {:08x} rr {:08x} "
+                     "rg {:08x} rb {:08x}; lights{}; texture {:08x}, types {}; reflection tables "
+                     "red = green {}, red = blue {}; tev{}",
+                     last_fragment_key, fg.output_u8, lt.raw,
+                     static_cast<u32>(lt.src_num.Value()), static_cast<u32>(lt.config.Value()),
+                     static_cast<u32>(lt.bump_mode.Value()),
+                     static_cast<u32>(lt.bump_selector.Value()),
+                     static_cast<u32>(lt.bump_renorm.Value()), lt.lut_d0.raw, lt.lut_d1.raw,
+                     lt.lut_sp.raw, lt.lut_fr.raw, lt.lut_rr.raw, lt.lut_rg.raw, lt.lut_rb.raw,
+                     lights, fc.texture.raw, static_cast<u32>(fc.texture.texture0_type.Value()),
+                     std::memcmp(pica.lighting.luts[6].data(), pica.lighting.luts[5].data(),
+                                 sizeof(pica.lighting.luts[6])) == 0,
+                     std::memcmp(pica.lighting.luts[6].data(), pica.lighting.luts[4].data(),
+                                 sizeof(pica.lighting.luts[6])) == 0,
+                     stages);
+        }
     }
 #endif
     if (!fg.samplers.empty()) {
