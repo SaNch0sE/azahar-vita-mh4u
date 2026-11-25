@@ -224,8 +224,11 @@ std::atomic<u32> tools_stream_recipes{};
 #endif
 
 // A block mapped at va for the GPU, in CDRAM: uncached for the CPU, so what it writes needs no
-// cache work. Without CDRAM it stops. `size` is a multiple of 256 KiB.
-u8* MapBlock(const char* name, u32 va, u32 size, int& uid) {
+// cache work. Without CDRAM it stops. `size` is a multiple of 256 KiB. Null, with the block given
+// back, when the kernel's GPU map refuses it: its range records (128) run out, as a recipe's own
+// block did past 7 of them (a Monster Hunter XX game's internal resolution changed in the pause
+// menu: the GPU then read an unmapped recipe and stopped).
+u8* TryMapBlock(const char* name, u32 va, u32 size, int& uid) {
     uid = sceKernelAllocMemBlock(name, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size, nullptr);
     void* base = nullptr;
     const int got = uid >= 0 ? sceKernelGetMemBlockBase(uid, &base) : uid;
@@ -234,14 +237,26 @@ u8* MapBlock(const char* name, u32 va, u32 size, int& uid) {
     [[maybe_unused]] const int idle = GpuIdleAt("idle: a block's map");
     DEBUG_ASSERT_MSG(idle == 0, "sgxd: a PTLA op never completed before mapping {}", name);
     const int mapped = sgxdMap(va, base, size, 0);
-    DEBUG_ASSERT_MSG(mapped == 0, "sgxd: {} not mapped at GPU {:#010x}: {:#010x}", name, va,
-                     static_cast<u32>(mapped));
+    if (mapped != 0) {
+        LOG_WARNING(Render, "sgxd: {} not mapped at GPU {:#010x}: {:#010x}", name, va,
+                    static_cast<u32>(mapped));
+        sceKernelFreeMemBlock(uid);
+        uid = -1;
+        return nullptr;
+    }
     // The map invalidates the BIF's caches, not the SLC, which the GPU's page-table walks go
     // through: a PTLA op as the first work in a new block faulted on a mapped page. The 3D's kicks
     // invalidate the SLC; the PTLA's lists do not.
     [[maybe_unused]] const int slc = sgxd_slc_invalidate();
     DEBUG_ASSERT_MSG(slc == 0, "sgxd: the SLC not emptied after mapping {}", name);
     return static_cast<u8*>(base);
+}
+
+/// TryMapBlock, for a block the backend cannot run without: one the GPU's map refuses stops.
+u8* MapBlock(const char* name, u32 va, u32 size, int& uid) {
+    u8* const memory = TryMapBlock(name, va, size, uid);
+    ASSERT_MSG(memory != nullptr, "sgxd: {} not mapped at GPU {:#010x}", name, va);
+    return memory;
 }
 
 void FreeBlock(u8* cpu, u32 va, u32 size, int uid) {
@@ -818,6 +833,10 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         if (!SlotsFull()) {
             return false;
         }
+        // The GPU's map took no more blocks: the recipes past the slots share the blocks they have.
+        if (own_blocks_refused) {
+            return true;
+        }
         SceKernelFreeMemorySizeInfo free{};
         free.size = sizeof(free);
         sceKernelGetFreeMemorySize(&free);
@@ -935,7 +954,18 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         r.reserve_slot = reserve_slot;
         r.memory = reserve + static_cast<u32>(reserve_slot) * RecipeBlockSize;
     } else {
-        r.memory = MapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
+        r.memory = TryMapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
+        if (r.memory == nullptr) {
+            // The kernel's GPU map has no range record left: no recipe takes a block of its own
+            // again, and this one is made as with CDRAM short, an instance waited for or the
+            // recipe used longest ago giving its block back (one of its own frees a record).
+            ASSERT_MSG(!own_blocks_refused, "sgxd: a {}x{} recipe's block refused twice", width,
+                       height);
+            own_blocks_refused = true;
+            LOG_WARNING(Render, "sgxd: the GPU's map takes no more recipe blocks: recipes past "
+                                "the slots share theirs from now");
+            return RecipeFor(width, height, kind, samples);
+        }
         if (r.va == next_va) {
             next_va = AlignUp(r.va + r.size, 1u << 20);
         }

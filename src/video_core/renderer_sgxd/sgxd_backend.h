@@ -785,6 +785,9 @@ private:
     void MakeRecipeReserve();
     /// Every slot that takes a recipe with no CDRAM of its own is used: the shell's, and the
     /// reserve's if there is one.
+    /// The kernel's GPU map refused a recipe's own block (its range records ran out): RecipeFor
+    /// then shares the recipes' blocks as with CDRAM short.
+    bool own_blocks_refused{};
     [[nodiscard]] bool SlotsFull() const {
         return shell_slots_used == (u64{1} << ShellSlots) - 1 &&
                (reserve == nullptr || reserve_slots_used == (u64{1} << ReserveSlots) - 1);
