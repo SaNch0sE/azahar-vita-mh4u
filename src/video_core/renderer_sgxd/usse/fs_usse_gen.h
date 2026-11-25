@@ -37,4 +37,20 @@ namespace SgxdRenderer::Usse {
 /// the bump map and the shadow texture, as the emitter plans them.
 [[nodiscard]] uint32_t SampledTextureUnits(const Pica::Shader::FSConfig& config);
 
+/**
+ * Per-vertex effect lighting (RasterizerSgxd::SetPvEffectLighting): whether a configuration's
+ * lighting can be made at the vertices, the rasterizer's and the emitters' one rule. It holds
+ * where the lighting is on with no bump map, one or two lights, each directional with no
+ * distance or spot attenuation, no geometric factor and no shadow, with specular_0 and
+ * specular_1 zero (so no specular term and no table but the Fresnel one), no shadow at all, and
+ * the Fresnel table off or read at N.V. Then, as upstream's generator has it:
+ *   primary.rgb = global_ambient + sum_i (ambient_i + diffuse_i * f(N.L_i)), f max(x, 0), or |x|
+ *       for a two-sided light, L_i the light's position normalised;
+ *   secondary.rgb = 0;
+ *   each alpha the Fresnel table at N.V where its enable_*_alpha asks, else 1;
+ * all clamped to [0, 1]. The vertex program makes primary.rgb and N.V (VsRequest::pv), the
+ * fragment program reads them as TEXCOORD4 and looks the Fresnel table up per pixel.
+ */
+[[nodiscard]] bool PvEffectEligible(const Pica::Shader::FSConfig& config);
+
 } // namespace SgxdRenderer::Usse

@@ -134,7 +134,8 @@ constexpr uint32_t DataLiteralCount = DataSize - 1;
 // (OutSelects, TexSize): POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
 // TEXCOORD3 o14-17 (the fog table's coordinate, Usse::TextureIssue::fog: the PICA depth times
 // w, and w, in its first and fourth lanes; texcoord0's w in its second), TEXCOORD4 o18-21 (the
-// quaternion), TEXCOORD5 o22-24 (the view). Upstream's flat copy of the quaternion is not written:
+// quaternion, or with per-vertex effect lighting the primary colour and N.V: PvLighting),
+// TEXCOORD5 o22-24 (the view). Upstream's flat copy of the quaternion is not written:
 // the fragment programs do not read it (FragmentEmitter::Lighting).
 constexpr uint8_t OutPosition = 0;
 constexpr uint8_t OutColor = 4;
@@ -348,6 +349,8 @@ private:
     void OutputPair(uint8_t out, Semantic s0, Semantic s1);
     void OutputTexcoord(uint8_t out, Semantic su, Semantic sv);
     void OutputLane(uint8_t out, int lane, Semantic s);
+    /// Per-vertex effect lighting (VsRequest::pv): TEXCOORD4 as (primary.rgb, N.V).
+    void PvLighting();
 
     const VsRequest& req;
     Scan scan;
@@ -367,6 +370,11 @@ private:
     uint32_t data_base = 0;            ///< the data block's first SA
     uint32_t sa_top = 0;               ///< SAs in use
     int int_sa = -1;                   ///< uniforms_i's SA base
+    /// Per-vertex effect lighting's resident uniforms (VsRequest::pv): PvAmbient's SA base, and
+    /// each light's PvLightVector and PvLightDiffuse.
+    uint32_t pv_ambient_sa = 0;
+    std::array<uint32_t, 2> pv_vector_sa{};
+    std::array<uint32_t, 2> pv_diffuse_sa{};
     uint8_t pa_inputs = 0;             ///< PA registers the attributes take
     uint32_t next_virtual = TmpQuads;  ///< the next free virtual quad's first register
     std::vector<uint8_t> prefetch;     ///< uniforms the SA image carries, by index
@@ -783,6 +791,34 @@ void VertexEmitter::Layout() {
         int_sa = static_cast<int>(resident);
         program.uniforms.push_back({UniformKind::IntUniforms, 0, resident, 4, 4});
         resident += 16;
+    }
+    if (req.pv.lights != 0) {
+        // Per-vertex effect lighting's float3s, a quad each (the fourth lane zero, never read):
+        // the ambient sum, then each light's vector and diffuse colour.
+        if (req.mode != VsMode::Draw || req.pv.lights > req.pv.num.size()) {
+            Refuse("per-vertex effect lighting outside a draw's program");
+        }
+        uint8_t mask = 0;
+        for (uint32_t i = 0; i < req.pv.lights; i++) {
+            mask |= static_cast<uint8_t>(1u << (req.pv.num[i] & 7));
+        }
+        pv_ambient_sa = resident;
+        program.uniforms.push_back({UniformKind::PvAmbient, mask, resident, 3, 1});
+        resident += 4;
+        for (uint32_t i = 0; i < req.pv.lights; i++) {
+            const uint8_t num = static_cast<uint8_t>(req.pv.num[i] & 7);
+            pv_vector_sa[i] = resident;
+            program.uniforms.push_back({UniformKind::PvLightVector, num, resident, 3, 1});
+            resident += 4;
+            pv_diffuse_sa[i] = resident;
+            program.uniforms.push_back({UniformKind::PvLightDiffuse, num, resident, 3, 1});
+            resident += 4;
+        }
+        // The data block and its literals after them must still fit (the prefetched uniforms
+        // stop at the limit on their own).
+        if (resident + DataSize + ExtraLiterals() > SaLimit) {
+            Refuse("per-vertex effect lighting's uniforms past the secondary attributes");
+        }
     }
     program.uniform_floats = resident;
 
@@ -2110,9 +2146,13 @@ void VertexEmitter::Epilogue() {
     e.Vec(VecOp::Min, {Reg::O(OutColor), 0x3}, {I1, XYZW, Mod::Abs}, ConstOne);
     e.Vec(VecOp::Min, {Reg::O(OutColor + 2), 0x3}, {I1, ZWZW, Mod::Abs}, ConstOne);
 
-    GatherFour(I2, SemQuaternionX);
-    e.MoveInternal({Reg::O(OutNormquat), 0x3}, {I2, XYZW});
-    e.MoveInternal({Reg::O(OutNormquat + 2), 0x3}, {I2, ZWZW});
+    if (req.pv.lights != 0) {
+        PvLighting();
+    } else {
+        GatherFour(I2, SemQuaternionX);
+        e.MoveInternal({Reg::O(OutNormquat), 0x3}, {I2, XYZW});
+        e.MoveInternal({Reg::O(OutNormquat + 2), 0x3}, {I2, ZWZW});
+    }
 
     OutputTexcoord(OutTexcoord0, SemTexcoord0U, SemTexcoord0V);
     OutputTexcoord(OutTexcoord1, SemTexcoord1U, SemTexcoord1V);
@@ -2120,6 +2160,62 @@ void VertexEmitter::Epilogue() {
     OutputLane(OutTexcoord3, 1, SemTexcoord0W);
     OutputPair(OutView, SemViewX, static_cast<Semantic>(SemViewX + 1));
     OutputLane(OutView + 2, 0, static_cast<Semantic>(SemViewX + 2));
+}
+
+void VertexEmitter::PvLighting() {
+    // Upstream's per-pixel lighting (glsl_fs_shader_gen.cpp, WriteLighting) made at the corner, for
+    // the fragment program's pv_effect form (FragmentEmitter::PvLighting): with no bump map the
+    // surface normal is (0, 0, 1) turned by normalize(quaternion), and with the lights
+    // Usse::PvEffectEligible lets through, primary.rgb = global_ambient + sum_i (ambient_i +
+    // diffuse_i * f(N.L_i)), the ambients summed by the rasterizer (PvAmbient). The quaternion's
+    // sign does not change the rotation, so the corner's own is right as it comes.
+    // i2 = q = normalize(quaternion)
+    GatherFour(I2, SemQuaternionX);
+    e.Dot({I0, 0x1}, {I2, XYZW}, {I2, XYZW}, true);
+    e.Comp(CompOp::Rsq, {I0, 0x1}, {I0}, 0);
+    e.Vec(VecOp::Mul, {I2, 0xf}, {I2, XYZW}, {I0, XXXX});
+    // N = rotate(q, (0, 0, 1)) = (2(xz + yw), 2(yz - xw), 1 - 2(x^2 + y^2)), into i0: i1 = (x^2,
+    // y^2, xz, yz), then the halves of N.x and N.y (a mad each: only the first source takes the
+    // negation) and x^2 + y^2, doubled together, and N.z = 1 - that.
+    constexpr Swizzle XYZZ{Ch::X, Ch::Y, Ch::Z, Ch::Z};
+    constexpr Swizzle XYXY{Ch::X, Ch::Y, Ch::X, Ch::Y};
+    e.Vec(VecOp::Mul, {I1, 0xf}, {I2, XYZZ}, {I2, XYXY});
+    e.Mad({I0, 0x1}, {I2, YYYY}, {I2, WWWW}, {I1, ZZZZ}, true);
+    e.Mad({I0, 0x2}, {I2, XXXX, Mod::Neg}, {I2, WWWW}, {I1, WWWW}, true);
+    e.Vec(VecOp::Add, {I0, 0x4}, {I1, XXXX}, {I1, YYYY});
+    e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I0, XYZW});
+    e.Vec(VecOp::Add, {I0, 0x4}, {I0, ZZZZ, Mod::Neg}, ConstOne);
+    // V = normalize(view) in i1, its three lanes as OutView takes them (a lane no attribute feeds
+    // is the emitter's 1.0 fill, as the fragment program would read it); lane w is not read.
+    for (int i = 0; i < 3; i++) {
+        const auto src = SemanticSrc(static_cast<Semantic>(SemViewX + i));
+        e.MoveInternal({I1, static_cast<uint8_t>(1u << i)}, src ? *src : ConstOne);
+    }
+    e.Dot({I2, 0x1}, {I1, XYZW}, {I1, XYZW}, false);
+    e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0);
+    e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {I2, XXXX});
+    // N.V into TEXCOORD4's w, for the fragment program's Fresnel lookup.
+    e.Dot({I2, 0x1}, {I0, XYZW}, {I1, XYZW}, false);
+    e.MoveInternal({Reg::O(OutNormquat + 2), 0x2}, {I2, XXXX});
+    // primary.rgb in i1: the ambient sum, then each light's diffuse * f(N.L) added, L its vector
+    // read where its uniform lies (a dot's first source and a mad's first source take the
+    // unified store four wide).
+    e.Vec(VecOp::Mul, {I1, 0xf}, {Reg::Sa(static_cast<uint8_t>(pv_ambient_sa)), XYZW}, ConstOne);
+    for (uint32_t i = 0; i < req.pv.lights; i++) {
+        e.Dot({I2, 0x1}, {Reg::Sa(static_cast<uint8_t>(pv_vector_sa[i])), XYZW}, {I0, XYZW},
+              false);
+        if ((req.pv.two_sided >> i & 1) != 0) {
+            e.Vec(VecOp::Add, {I2, 0x1}, {I2, XXXX, Mod::Abs}, ConstZero);
+        } else {
+            e.Vec(VecOp::Max, {I2, 0x1}, {I2, XXXX}, ConstZero);
+        }
+        e.Mad({I1, 0x7}, {Reg::Sa(static_cast<uint8_t>(pv_diffuse_sa[i])), XYZW}, {I2, XXXX},
+              {I1, XYZW}, true);
+    }
+    // Unclamped: the fragment program clamps (or packs, which saturates) after the iteration, as
+    // the per-pixel sum is clamped once.
+    e.MoveInternal({Reg::O(OutNormquat), 0x3}, {I1, XYZW});
+    e.MoveInternal({Reg::O(OutNormquat + 2), 0x1}, {I1, ZWZW});
 }
 
 std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {

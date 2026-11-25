@@ -120,6 +120,14 @@ public:
     /// Whether draws read shadows the fast way now (the option and the title's bit, or the
     /// diagnostics flag shadowfast).
     [[nodiscard]] static bool FastShadows();
+    /// The Per-vertex effect lighting option: for a title with TuningPvEffectLighting, a blended
+    /// draw whose lighting Usse::PvEffectEligible lets through is lit at its vertices (the vertex
+    /// program's VsPvEffect form), not at every pixel; the fragment program reads the colour and
+    /// N.V for its Fresnel lookup. Any thread; draws after it changes take it.
+    static void SetPvEffectLighting(bool on);
+    /// Whether eligible blended draws are lit at their vertices now (the option and the title's
+    /// bit, or the diagnostics flag pveffect).
+    [[nodiscard]] static bool PvEffectLighting();
     /// What applies now: SetHudScale's for a title with the tuning, else 4.
     [[nodiscard]] static u32 HudScale();
     /// Whether the top screen's 2D layer is drawn at the HUD scale now: one above the internal
@@ -390,6 +398,10 @@ private:
         u32 bank_rows;
         /// The Input attribute's first primary attribute register by input register; ~0u: none.
         std::array<u32, 16> attr_resource;
+        /// The program lights the draw at its vertices (VsPvEffect: it has a PvAmbient uniform), so
+        /// the fragment program takes the pv_effect form. A program asked for it may lack it where
+        /// its emission refused it (VertexProgramFor).
+        bool pv_effect;
     };
     static void ResolveVertexProgram(VertexProgram& v);
     /// The buffer a program's SA pointer names (zeros and the float bank), built once and named again
@@ -516,8 +528,9 @@ private:
     };
     /// The loaders' attributes into the PICA's vertex program. With StoreOutputs the fetch covers
     /// vertex_min to vertex_max densely and the caller adds the stores and the index list.
+    /// `pv`: per-vertex effect lighting's lights (PvEffectRequest), 0 for none.
     VertexStage VertexStageFor(bool is_indexed, const float* immediate, u32 count,
-                               Usse::VsMode mode, const Describe& describe);
+                               Usse::VsMode mode, const Describe& describe, u32 pv = 0);
     /// A draw with a geometry shader: the vertex program's outputs and the geometry program's triangles
     /// through two stream-out renders, then the triangles as the draw's vertices (the SGX has no
     /// geometry stage, so the geometry program runs as a vertex program that stores what it emits).
@@ -635,6 +648,9 @@ private:
         std::array<u8, 16> reg_components;
         Usse::VsMode mode;
         u16 bools, used_bools;
+        /// Per-vertex effect lighting's lights (PvEffectRequest's encoding), 0 for none: in the key
+        /// only when set, so the other programs keep theirs.
+        u32 pv = 0;
     };
     static u64 VertexKeyOf(const Pica::Shader::Generator::PicaVSConfig& config,
                            const VertexInputs& in);
@@ -644,7 +660,7 @@ private:
     const VertexProgram& VertexProgramFor(u16 default_regs,
                                           const std::array<u8, 16>& reg_components, u16 u8_regs,
                                           u16 s8_regs, u16 s16_regs,
-                                          Usse::VsMode mode = Usse::VsMode::Draw);
+                                          Usse::VsMode mode = Usse::VsMode::Draw, u32 pv = 0);
     VertexProgram PlaceVertexProgram(Usse::Program usse, const char* what, u64 key,
                                      u64 emit_us = 0);
     /// The geometry program for `rows` input rows and at most `max_triangles` triangles an invocation;
@@ -928,11 +944,25 @@ private:
     bool draw_kills_viewport = false;
     /// The draw writes depth or tests the stencil: the alpha test stays a kill.
     bool draw_depth_stencil = false;
+    /// The draw is lit at its vertices: its vertex program has the VsPvEffect form, so its fragment
+    /// program takes the pv_effect one (FragmentConfigFor).
+    bool draw_pv_effect = false;
+    bool last_fragment_pv = false;
+    /// Per-vertex effect lighting for this draw (Draw): 0 for none, else the lights the vertex
+    /// program is asked to light, encoded (bits 0-1 the count, 2-3 two-sided, 4-6 and 7-9 the
+    /// lights' numbers). What the registers allow is kept by their hash (StateRegs::Fragment), as
+    /// fragment_states keeps the programs: an FSConfig built once a state.
+    u32 PvEffectRequest(bool blend);
+    KeyIndex<u32> pv_requests;
+    u64 pv_regs_hash = 0;
+    bool pv_regs_known = false;
+    u32 pv_regs_request = 0;
     /// FSConfig from the registers, with the sgxd_flags' changes and the units' alpha split.
     Pica::Shader::FSConfig FragmentConfig() const;
-    /// FragmentConfig of any registers (the parse thread's too).
+    /// FragmentConfig of any registers (the parse thread's too). `pv_effect`: the draw's vertex
+    /// program lights it (draw_pv_effect), so an eligible configuration takes the pv_effect form.
     static Pica::Shader::FSConfig FragmentConfigFor(const Pica::RegsInternal& regs, u32 own_pixel,
-                                                    bool kills_viewport);
+                                                    bool kills_viewport, bool pv_effect = false);
     /// The hashes of StateRegs' sets, and whether a set's registers changed since.
     u64 fragment_regs_hash = 0;
     u64 layout_regs_hash = 0;

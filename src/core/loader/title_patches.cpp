@@ -268,12 +268,15 @@ constexpr std::array title_patches{
                             "short where their sprites lie far apart in the game's data. A screen "
                             "the layout does not show is not drawn."),
                std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
-                   TuningEvenPacing | TuningKeepMovedPages | TuningFastShadows},
-    // Monster Hunter XX (Japan): the Fast shadows option alone; the rest runs as in beta-1.
-    TitlePatch{MonsterHunterXxJpn, Translatable("Fast shadows option"),
-               Translatable("Offers the Fast shadows option for this game. It changes nothing by "
-                            "itself."),
-               std::span<const PatchWord>{}, nullptr, TuningFastShadows | TuningGeometryBatches},
+                   TuningEvenPacing | TuningKeepMovedPages | TuningFastShadows |
+                   TuningPvEffectLighting},
+    // Monster Hunter XX (Japan): the Fast shadows and Per-vertex effect lighting options and the
+    // geometry shader draws' room; the rest runs as in beta-1.
+    TitlePatch{MonsterHunterXxJpn, Translatable("Speed options"),
+               Translatable("Offers the Fast shadows and Per-vertex effect lighting options for "
+                            "this game. It changes nothing by itself."),
+               std::span<const PatchWord>{}, nullptr,
+               TuningFastShadows | TuningGeometryBatches | TuningPvEffectLighting},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),

@@ -327,6 +327,11 @@ struct LightConfig {
         /// Set by the sgxd backend alone, from the registers: every light's specular_0 is
         /// zero, so its term (D0 with it) is left out of the program.
         BitField<24, 1, u32> specular0_zero;
+        /// sgxd: per-vertex effect lighting (the Per-vertex effect lighting option, set by the
+        /// rasterizer where SgxdRenderer::Usse::PvEffectEligible holds and the draw's vertex
+        /// program made the colour): TEXCOORD4 brings the primary colour and N.V from the
+        /// vertices, and the program reads only the Fresnel table.
+        BitField<25, 1, u32> pv_effect;
     };
     LutConfig lut_d0{};
     LutConfig lut_d1{};

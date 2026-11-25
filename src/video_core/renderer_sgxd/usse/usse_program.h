@@ -182,6 +182,14 @@ enum class UniformKind : uint8_t {
     /// Stage `index`'s constant colour as a U8 Dot3 reads it (FragmentEmitter::U8Dot3Const):
     /// 4 (b - 0.5) in x, y and z and -2 sum(b - 0.5) in w, b its bytes over 255.
     Dot3Const,
+    // Vertex programs, per-vertex effect lighting (VsPvEffect), each a float3:
+    /// lighting_global_ambient plus the ambient colour of each light in the mask `index` (bit n
+    /// light_src[n]): the lights' ambient adds are unattenuated, so their sum is the draw's.
+    PvAmbient,
+    /// Light `index`'s position normalised: a directional light's vector.
+    PvLightVector,
+    /// Light `index`'s diffuse colour.
+    PvLightDiffuse,
 };
 
 struct Uniform {

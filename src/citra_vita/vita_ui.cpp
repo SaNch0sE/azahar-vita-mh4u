@@ -1872,6 +1872,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::PvEffectLighting,
+         Category::Patches,
+         Kind::Toggle,
+         Translatable("Per-vertex effect lighting"),
+         Translatable("Lights blended effects such as mist and smoke at their corners instead of at "
+                      "every pixel. They may look slightly different; the GPU does much less work "
+                      "when such effects cover the screen."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::SimulateGpuTimings,
          Category::Speed,
          Kind::Toggle,
@@ -3570,6 +3581,8 @@ Ui::Action Ui::DrawSettings() {
             const u32 bit = rows[i].option == Config::Option::EvenPacing ? Loader::TuningEvenPacing
                             : rows[i].option == Config::Option::FastShadows
                                 ? Loader::TuningFastShadows
+                            : rows[i].option == Config::Option::PvEffectLighting
+                                ? Loader::TuningPvEffectLighting
                                 : Loader::TuningHudScale;
             if ((Loader::TitleTuningOf(settings_program_id) & bit) != 0) {
                 DrawRow(rows[i], i);

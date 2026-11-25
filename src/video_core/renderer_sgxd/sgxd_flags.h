@@ -94,6 +94,9 @@ namespace SgxdRenderer {
  *             read costs in lit programs
  *   shadowfast Shadow2D read once with a LINEAR filter and compared once (hard edges), not
  *             four point taps compared and blended
+ *   pveffect  per-vertex effect lighting for any title (RasterizerSgxd::PvEffectLighting): a
+ *             blended draw whose lighting Usse::PvEffectEligible lets through is lit at its
+ *             vertices, its fragment program reading only the Fresnel table
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks

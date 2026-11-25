@@ -53,6 +53,20 @@ struct VsSemantic {
  */
 enum class VsMode : uint8_t { Draw, StoreOutputs, Geometry };
 
+/**
+ * Per-vertex effect lighting (Usse::PvEffectEligible), Draw mode only: the epilogue writes
+ * TEXCOORD4 as (primary.rgb, N.V) in place of the quaternion, for the fragment program's
+ * pv_effect form. N is (0, 0, 1) turned by the normalised quaternion and V the view normalised,
+ * as upstream's generator makes them per pixel; primary.rgb = PvAmbient + sum_i PvLightDiffuse_i *
+ * f(N . PvLightVector_i), unclamped, f max(x, 0) or |x| for a two-sided light (UniformKind's Pv
+ * kinds, which the rasterizer fills).
+ */
+struct VsPvEffect {
+    uint8_t lights = 0;          ///< 1 or 2; 0: off
+    std::array<uint8_t, 2> num{}; ///< each light's PICA number (light_src[num])
+    uint8_t two_sided = 0;       ///< bit i: light i's diffuse is two-sided
+};
+
 struct VsRequest {
     std::span<const uint32_t> code;    ///< the PICA program code
     std::span<const uint32_t> swizzle; ///< the operand descriptors
@@ -96,6 +110,8 @@ struct VsRequest {
     /// and the state block (its stores); each entry is the words the parallel form's attribute
     /// holds. The count is at least one.
     bool gs_serial = false;
+    /// Per-vertex effect lighting's lights (VsPvEffect), Draw mode only.
+    VsPvEffect pv{};
 };
 
 /// The in-order state block (VsRequest::gs_serial), in float4s: the 16 temporaries, then the emit

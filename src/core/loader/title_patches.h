@@ -79,6 +79,9 @@ enum TitleTuningBit : u32 {
     /// The Fast shadows option applies (RasterizerSgxd::SetFastShadows): offered where it has been
     /// measured.
     TuningFastShadows = 1u << 5,
+    /// The Per-vertex effect lighting option applies (RasterizerSgxd::SetPvEffectLighting): offered
+    /// where it has been tried.
+    TuningPvEffectLighting = 1u << 6,
 };
 inline std::atomic<u32> title_tuning{0};
 /// The tuning bits a title's built-in patches ask for (a menu's: the title need not be running).

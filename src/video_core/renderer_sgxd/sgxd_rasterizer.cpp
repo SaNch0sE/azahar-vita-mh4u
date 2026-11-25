@@ -939,6 +939,82 @@ bool RasterizerSgxd::FastShadows() {
            Loader::TitleTuned(Loader::TuningFastShadows);
 }
 
+namespace {
+std::atomic<bool> pv_effect_lighting{false};
+
+/// Per-vertex effect lighting's lights for an eligible configuration (Usse::PvEffectEligible), in
+/// RasterizerSgxd::PvEffectRequest's encoding: bits 0-1 the count, 2-3 each light's two-sided
+/// diffuse, 4-6 and 7-9 their PICA numbers. 0 for an ineligible one.
+u32 PvRequestOf(const Pica::Shader::FSConfig& config) {
+    if (!SgxdRenderer::Usse::PvEffectEligible(config)) {
+        return 0;
+    }
+    const auto& lighting = config.lighting;
+    u32 request = static_cast<u32>(lighting.src_num.Value());
+    for (u32 i = 0; i < lighting.src_num; i++) {
+        const auto& light = lighting.lights[i];
+        request |= static_cast<u32>(light.two_sided_diffuse.Value()) << (2 + i);
+        request |= static_cast<u32>(light.num.Value() & 7) << (4 + 3 * i);
+    }
+    return request;
+}
+
+/// PvRequestOf's encoding as the vertex emitter takes it.
+SgxdRenderer::Usse::VsPvEffect PvEffectOf(u32 request) {
+    SgxdRenderer::Usse::VsPvEffect pv{};
+    pv.lights = static_cast<u8>(request & 3);
+    pv.two_sided = static_cast<u8>(request >> 2 & 3);
+    pv.num = {static_cast<u8>(request >> 4 & 7), static_cast<u8>(request >> 7 & 7)};
+    return pv;
+}
+} // Anonymous namespace
+
+void RasterizerSgxd::SetPvEffectLighting(bool on) {
+    pv_effect_lighting.store(on, std::memory_order_relaxed);
+}
+
+bool RasterizerSgxd::PvEffectLighting() {
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags pveffect: the same for any title.
+    static const bool flag = SgxdFlag("pveffect");
+    if (flag) {
+        return true;
+    }
+#endif
+    return pv_effect_lighting.load(std::memory_order_relaxed) &&
+           Loader::TitleTuned(Loader::TuningPvEffectLighting);
+}
+
+u32 RasterizerSgxd::PvEffectRequest(bool blend) {
+    // Blended draws alone, through the ordinary vertex program (a geometry shader's triangles come
+    // from the stream-out renders, which make no TEXCOORD4): opaque surfaces keep their per-pixel
+    // lighting, and a stack of translucent layers such as mist is where the per-pixel work
+    // multiplies.
+    if (!blend || regs.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes || !PvEffectLighting()) {
+        return 0;
+    }
+    // The lighting part of FSConfig depends on the fragment registers alone (the lights' colours'
+    // zeroness among them), so the answer stands until they change.
+    if (fragment_regs_dirty) {
+        fragment_regs_dirty = false;
+        fragment_regs_hash = StateRegs::Hash(StateRegs::Fragment, regs.reg_array);
+    }
+    if (!pv_regs_known || pv_regs_hash != fragment_regs_hash) {
+        pv_regs_known = true;
+        pv_regs_hash = fragment_regs_hash;
+        if (const u32* const found = pv_requests.Find(fragment_regs_hash)) {
+            pv_regs_request = *found;
+        } else {
+            if (pv_requests.Size() >= MaxFragmentStates) {
+                pv_requests.Clear();
+            }
+            pv_regs_request = PvRequestOf(FragmentConfigFor(regs, 0, false));
+            pv_requests.Emplace(fragment_regs_hash, u32{pv_regs_request});
+        }
+    }
+    return pv_regs_request;
+}
+
 void RasterizerSgxd::SetHudScale(u32 quarters) {
     hud_scale.store(std::clamp(quarters, 4u, 8u), std::memory_order_relaxed);
 }
@@ -4423,12 +4499,15 @@ void RasterizerSgxd::LogTextureStats() {
 
 u64 RasterizerSgxd::VertexKeyOf(const Pica::Shader::Generator::PicaVSConfig& config,
                                 const VertexInputs& in) {
-    return Common::HashCombine(
+    const u64 key = Common::HashCombine(
         config.Hash(),
         static_cast<u64>(in.mode) << 32 | static_cast<u64>(in.u8_regs) << 16 | in.default_regs,
         static_cast<u64>(in.bools) << 16 | in.used_bools |
             (static_cast<u64>(in.s8_regs) << 32 | static_cast<u64>(in.s16_regs) << 48),
         Common::ComputeHash64(in.reg_components.data(), in.reg_components.size()));
+    // Per-vertex effect lighting's variants apart from the plain program and from each other, in
+    // every cache (memory, the second tier, the disk); the plain program's key is as before.
+    return in.pv != 0 ? Common::HashCombine(key, 0x7076656600000000ull | in.pv) : key;
 }
 
 Usse::VsRequest RasterizerSgxd::VertexRequestOf(const Pica::Shader::Generator::PicaVSConfig& config,
@@ -4456,6 +4535,7 @@ Usse::VsRequest RasterizerSgxd::VertexRequestOf(const Pica::Shader::Generator::P
     request.s8_regs = in.s8_regs;
     request.s16_regs = in.s16_regs;
     request.mode = in.mode;
+    request.pv = PvEffectOf(in.pv);
     return request;
 }
 
@@ -4519,7 +4599,7 @@ void RasterizerSgxd::PrefetchVertex(const Pica::RegsInternal& parse_regs,
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     u16 default_regs, const std::array<u8, 16>& reg_components, u16 u8_regs, u16 s8_regs,
-    u16 s16_regs, Usse::VsMode mode) {
+    u16 s16_regs, Usse::VsMode mode, u32 pv) {
     const Pica::Shader::Generator::PicaVSConfig config{regs, pica.vs_setup};
     const auto& state = config.state;
     // The bools the program branches on are baked in; which ones is found once per program.
@@ -4534,7 +4614,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
                           reg_components,
                           mode,
                           static_cast<u16>(BoolUniforms(pica.vs_setup) & *used),
-                          *used};
+                          *used,
+                          pv};
     const u64 key = VertexKeyOf(config, in);
     if (VertexProgram* const found = vertex_programs.Find(key)) {
         VertexProgram& v = *found;
@@ -4577,6 +4658,9 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     std::string refusal;
     std::optional<Usse::Program> emitted;
     u64 emit_us = 0;
+    // The request the program was emitted from: tier 2 re-emits that one (a refused per-vertex
+    // lighting request would be refused there again, and a tier-2 program must exist).
+    Usse::VsRequest emitted_request = request;
     if (taken) {
         emitted = std::move(taken->program);
         v.input_regs = taken->input_regs;
@@ -4585,6 +4669,17 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     } else {
         const u32 emit_start = azaharCyclesStart();
         emitted = Usse::EmitVertexProgram(request, v.input_regs, Usse::Scratch::Render, &refusal);
+        if (!emitted && pv != 0) {
+            // Per-vertex effect lighting refused (its uniforms past the SAs): the plain program
+            // under this key, without the PvAmbient uniform, so the draw keeps per-pixel lighting
+            // (VertexProgram::pv_effect).
+            LOG_WARNING(Render, "sgxd: vertex program {:016x}: no per-vertex effect lighting: {}",
+                        state.program_hash, refusal);
+            Usse::VsRequest plain = request;
+            plain.pv = {};
+            emitted = Usse::EmitVertexProgram(plain, v.input_regs, Usse::Scratch::Render, &refusal);
+            emitted_request = plain;
+        }
         emit_us = Common::CyclesToUs(azaharCycles() - emit_start);
         NoteEmit(0, emit_us);
     }
@@ -4605,7 +4700,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
               v.usse.per_instance ? ", per instance" : "", emit_us, taken ? " (worker)" : "");
     if (tier2 && v.usse.primary.size() >= Tier2Words) {
         v.tier2_queued = true;
-        tier2->QueueVertex(key, request);
+        tier2->QueueVertex(key, emitted_request);
     }
     return vertex_programs.Emplace(key, std::move(v));
 }
@@ -4621,8 +4716,10 @@ void RasterizerSgxd::ResolveVertexProgram(VertexProgram& v) {
     v.sa_scratch = v.sa_image;
     v.sa_slots.clear();
     v.has_bank = false;
+    v.pv_effect = false;
     for (u32 n = 0; n < g.uniforms.size(); n++) {
         const Usse::Uniform& u = g.uniforms[n];
+        v.pv_effect = v.pv_effect || u.kind == Usse::UniformKind::PvAmbient;
         if (u.kind == Usse::UniformKind::FloatBank) {
             DEBUG_ASSERT(g.buffer_pointer && u.sa_offset + u.array_size * 4 <= g.buffer_floats);
             v.has_bank = true;
@@ -5483,7 +5580,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
 }
 
 Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
-    return FragmentConfigFor(regs, draw_own_pixel, draw_kills_viewport);
+    return FragmentConfigFor(regs, draw_own_pixel, draw_kills_viewport, draw_pv_effect);
 }
 
 void RasterizerSgxd::PrefetchFragment(const Pica::RegsInternal& parse_regs) {
@@ -5491,7 +5588,8 @@ void RasterizerSgxd::PrefetchFragment(const Pica::RegsInternal& parse_regs) {
 }
 
 Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInternal& regs,
-                                                         u32 own_pixel, bool kills_viewport) {
+                                                         u32 own_pixel, bool kills_viewport,
+                                                         bool pv_effect) {
     Pica::Shader::FSConfig config{regs};
     // Fast shadows: one linear read of a Shadow2D unit 0 (TextureWords forces its filters).
     if (config.texture.texture0_type == Pica::TexturingRegs::TextureConfig::Shadow2D &&
@@ -5558,6 +5656,11 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
             }
         }
 #endif
+    }
+    // Per-vertex effect lighting: the draw's vertex program lit it (draw_pv_effect, which
+    // PvEffectRequest asked for by the same rule), so the program reads the colour it made.
+    if (pv_effect && Usse::PvEffectEligible(config)) {
+        lighting.pv_effect.Assign(1);
     }
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.
@@ -5669,12 +5772,13 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
     if (!last_fragment || fragment_regs_hash != last_fragment_regs ||
         epilogue_key != last_fragment_epilogue || draw_own_pixel != last_fragment_own ||
         draw_kills_viewport != last_fragment_kills ||
-        draw_depth_stencil != last_fragment_depth_stencil) {
+        draw_depth_stencil != last_fragment_depth_stencil || draw_pv_effect != last_fragment_pv) {
         last_fragment_regs = fragment_regs_hash;
         last_fragment_epilogue = epilogue_key;
         last_fragment_own = draw_own_pixel;
         last_fragment_kills = draw_kills_viewport;
         last_fragment_depth_stencil = draw_depth_stencil;
+        last_fragment_pv = draw_pv_effect;
         // The own-pixel units come from the vertices, the viewport's kill from the pass, and the depth and
         // stencil writes from registers the fragment ones leave out.
         u64 state = Common::HashCombine(fragment_regs_hash, epilogue_key);
@@ -5686,6 +5790,10 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
         }
         if (draw_depth_stencil) {
             state = Common::HashCombine(state, 0x64737772u);
+        }
+        // The draw's vertex program lit it (per-vertex effect lighting).
+        if (draw_pv_effect) {
+            state = Common::HashCombine(state, 0x70766566u);
         }
         if (const FragmentState* const found = fragment_states.Find(state)) {
             last_fragment = found->program;
@@ -6666,7 +6774,7 @@ void WidenIndices(u16* out, const u8* in, u32 count) {
 
 RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
                                                          u32 count, Usse::VsMode mode,
-                                                         const Describe& describe) {
+                                                         const Describe& describe, u32 pv) {
     const auto& pipeline = regs.pipeline;
     const auto& va = pipeline.vertex_attributes;
     const PAddr base = va.GetPhysicalBaseAddress();
@@ -6718,12 +6826,15 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     std::array<u32, VertexLayout::ProgramKeyWords> program_key{};
     if (layout) {
         program_key = VertexProgramKey(regs, pica.vs_setup, mode);
+        // Per-vertex effect lighting's variant is another program for the same layout.
+        program_key[15] |= pv << 8;
         if (layout->program && layout->program->tier2_queued && layout->program_key == program_key) {
             program = layout->program;
         }
     }
     if (!program) {
-        program = &VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode);
+        program = &VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode,
+                                    pv);
         if (layout) {
             layout->program_key = program_key;
             layout->program = program;
@@ -7081,6 +7192,31 @@ SgxdBackend::Data RasterizerSgxd::VertexSa(const VertexProgram& vp,
             PutVec(out, value, slot.components);
             break;
         }
+        // Per-vertex effect lighting (Usse::VsPvEffect), from the same light uniforms the fragment
+        // programs read (SyncDrawUniforms has brought them up to date for the draw).
+        case Kind::PvAmbient: {
+            Common::Vec3f sum = fs_data.lighting_global_ambient;
+            for (u32 num = 0; num < 8; num++) {
+                if ((slot.index >> num & 1) != 0) {
+                    sum += fs_data.light_src[num].ambient;
+                }
+            }
+            PutVec(out, sum.AsArray(), 3);
+            break;
+        }
+        case Kind::PvLightVector: {
+            // normalize(position), as a directional light's vector (UniformKind::LightDirection).
+            DEBUG_ASSERT(slot.index < 8);
+            const Common::Vec3f& p = fs_data.light_src[slot.index].position;
+            const float scale = 1.0f / std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+            const float value[3] = {p.x * scale, p.y * scale, p.z * scale};
+            PutVec(out, value, 3);
+            break;
+        }
+        case Kind::PvLightDiffuse:
+            DEBUG_ASSERT(slot.index < 8);
+            PutVec(out, fs_data.light_src[slot.index].diffuse.AsArray(), 3);
+            break;
         default:
             UNREACHABLE_MSG("sgxd: {}: the vertex uniform {} has no value", describe(),
                             Usse::UniformName(vg.uniforms[slot.uniform]));
@@ -7981,6 +8117,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     DEBUG_ASSERT_MSG(!shadow || fb.color_format == FramebufferRegs::ColorFormat::RGBA8,
                      "sgxd: {}: a shadow map in colour format {}", describe(),
                      static_cast<u32>(fb.color_format.Value()));
+    // Set again by the vertex stage (per-vertex effect lighting); until then the plain form, for
+    // every FragmentConfig() before it.
+    draw_pv_effect = false;
     // A texture unit that reads the pixel's own colour reads the tile (OwnPixelUnits).
     draw_own_pixel = OwnPixelUnits(is_indexed, immediate, count);
     // The colour write mask: without a blend, the pack's byte mask; with one, the masked channels blend
@@ -8841,14 +8980,18 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
     // geometry shader, the triangles its passes stored ---
     draw_view = DrawViewport();
+    // Per-vertex effect lighting: a blended draw whose lighting allows it asks its vertex program
+    // to light it; the fragment program follows what that program does.
+    const u32 pv_request = PvEffectRequest(blend);
     const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
                                   ? GeometryStage(is_indexed, describe)
                                   : VertexStageFor(is_indexed, immediate, count,
-                                                   Usse::VsMode::Draw, describe);
+                                                   Usse::VsMode::Draw, describe, pv_request);
     if (stage.count == 0) {
         return true; // the geometry program stored no triangle
     }
     const VertexProgram& vp = *stage.vp;
+    draw_pv_effect = pv_request != 0 && vp.pv_effect;
     const Usse::Program& vg = vp.usse;
     draw_clip_z_sign = ClipZSign(vp, *stage.setup, draw_near_w);
 

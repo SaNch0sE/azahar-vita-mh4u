@@ -391,6 +391,28 @@ private:
     void SampleTextures(uint32_t units = 7);
     void RoundPrimary();
     void Lighting();
+    /// What the stages read of the lighting's sums (Lighting, PvLighting): whether the sums are
+    /// packed to U8 where the lighting ends (no argument moves a lane of one; else U8Inputs
+    /// packs them from their F32 lanes), whether an argument reads each sum's alpha (always, but
+    /// for packed sums), and the secondary colour's colour lanes the arguments read (a bit each).
+    struct LitReads {
+        bool packed;
+        bool primary_alpha;
+        bool secondary_alpha;
+        uint32_t secondary_lanes;
+    };
+    LitReads LitSumReads() const;
+    /// Per-vertex effect lighting (LightConfig pv_effect, PvEffectEligible): the lighting is the
+    /// vertex program's, made at the corners.
+    bool Pv() const {
+        return config.lighting.pv_effect != 0;
+    }
+    /// Per-vertex effect lighting's sums from TEXCOORD4 (the primary colour, N.V), the Fresnel
+    /// table looked up at its N.V into the alphas that ask for it.
+    void PvLighting();
+    /// Whether PvLighting reads the Fresnel table: it is on and a stage reads an alpha it goes
+    /// into.
+    bool PvFresnelRead() const;
     /// The LUT's value at `input` into `into` (one temp lane): a filtered read of the LUT's F16
     /// row, times `scale` if given. `pair_free`: `into` is an even lane with a free neighbour, so
     /// an unscaled read lands there itself (LightingLutRowFetch).
@@ -797,6 +819,11 @@ const char* FragmentEmitter::Unsupported() const {
         (tex.texture_border_color[0].enable_s || tex.texture_border_color[0].enable_t)) {
         return "cube texture border colour";
     }
+    // The rasterizer sets it only where the rule holds; a vertex program made for it would light
+    // something else.
+    if (lighting.pv_effect && !PvEffectEligible(config)) {
+        return "per-vertex effect lighting on a configuration it does not fit";
+    }
     for (u32 i = 0; i < tex.tev_stages.size(); i++) {
         const TevStageConfig stage = tex.tev_stages[i];
         if (IsPassThroughTevStage(stage)) {
@@ -965,7 +992,12 @@ void FragmentEmitter::PlanInputs() {
             uses_border = true;
         }
     }
-    if (uses_lighting) {
+    if (uses_lighting && Pv()) {
+        // Per-vertex effect lighting reads the Fresnel table alone (PvLighting).
+        if (PvFresnelRead()) {
+            (lighting.lut_fr.abs_input ? lut_half_used : lut_wrap_used) = true;
+        }
+    } else if (uses_lighting) {
         // The lookups read the filtered F16 rows, a signed one repeating in u.
         const auto note = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
             if (LightingLutEnabled(lut, sampler)) {
@@ -1007,7 +1039,8 @@ void FragmentEmitter::PlanInputs() {
         position_pa = pa;
         pa += 4;
     }
-    // The quaternion alone: the flat copy's sign does not change the rotation.
+    // The quaternion alone: the flat copy's sign does not change the rotation. Per-vertex effect
+    // lighting: the vertex program's primary colour and N.V in its place (PvLighting).
     if (uses_lighting) {
         program.inputs.push_back({FragmentInput::TexCoord4, 4, true});
         normquat_pa = pa;
@@ -1077,7 +1110,8 @@ void FragmentEmitter::PlanInputs() {
         program.issues.push_back(issue);
         pa += u8_tev ? IssueTexelWordsF16 : IssueTexelWords;
     }
-    if (uses_lighting) {
+    // Per-vertex effect lighting reads no view: TEXCOORD5 is not iterated, as in an unlit program.
+    if (uses_lighting && !Pv()) {
         // Declared four wide, as psp2cgc declares a half3 varying: the console allocates by
         // the declaration.
         program.inputs.push_back({FragmentInput::TexCoord5, 4, true});
@@ -1333,7 +1367,18 @@ void FragmentEmitter::PlanUniforms() {
     light_memory.fill(-1);
     sa_lut_row.fill(UINT32_MAX);
     sa_lut_coord.fill(UINT32_MAX);
-    if (uses_lighting) {
+    if (uses_lighting && Pv() && PvFresnelRead()) {
+        // Per-vertex effect lighting: the vertex program made the colour, so neither the lights
+        // nor the global ambient take SAs here. The Fresnel table's (offset or bound, row) pair
+        // alone (LightingLutLookup's fold), well inside the budget.
+        const UniformKind kind = static_cast<bool>(lighting.lut_fr.abs_input)
+                                     ? UniformKind::LightingLutCoordHalf
+                                     : UniformKind::LightingLutCoordWrap;
+        constexpr uint32_t fresnel = static_cast<uint32_t>(Sampler::Fresnel);
+        sa_lut_coord[fresnel] = AllocateUniform(kind, 2, 1, static_cast<uint8_t>(fresnel));
+        sa_lut_row[fresnel] = sa_lut_coord[fresnel] + 1;
+    }
+    if (uses_lighting && !Pv()) {
         // A row scalar for each LUT read, packed: a prefix up to the highest of the 24 took the SAs
         // a resident light needs.
         std::array<bool, 24> row_used{};
@@ -2800,20 +2845,7 @@ void FragmentEmitter::LightingLutRowFetch(Sampler sampler, bool abs_input, Dst i
     }
 }
 
-void FragmentEmitter::Lighting() {
-    const auto& lighting = config.lighting;
-    const Vec4Loc normquat{Bank::PrimAttr, normquat_pa, true};
-    const Vec4Loc view{Bank::PrimAttr, view_pa, true};
-    const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
-    const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
-    const Vec4Loc normal{Bank::Virtual, TmpNormal};
-    const Vec4Loc tangent{Bank::Virtual, TmpTangent};
-    const Vec4Loc nview{Bank::Virtual, TmpView};
-    const Vec4Loc half_vector{Bank::Virtual, TmpHalf};
-    const Reg dot_product = Reg::V(TmpMisc);   // .x; .y the squared half vector length
-    const Reg misc_hi = Reg::V(TmpMisc + 2);   // .x the attenuation, .y light distance
-    const bool config7 = lighting.config == LightingRegs::LightingConfig::Config7;
-
+FragmentEmitter::LitReads FragmentEmitter::LitSumReads() const {
     // For the U8 combiners the sums are packed at the end, the pack saturating as the clamp does
     // (2.0 and -1.0 pack to 0xff and 0x00), unless a moved channel of one is packed again from its
     // F32 lanes (U8Inputs' broadcasts). Packed, a sum's alpha byte is read only by an argument
@@ -2849,9 +2881,30 @@ void FragmentEmitter::Lighting() {
             }
         });
     }
-    u8_lighting_packed = u8_tev && !lanes_moved;
-    primary_alpha_read = primary_alpha_read || !u8_lighting_packed;
-    secondary_alpha_read = secondary_alpha_read || !u8_lighting_packed;
+    const bool packed = u8_tev && !lanes_moved;
+    return {packed, primary_alpha_read || !packed, secondary_alpha_read || !packed,
+            secondary_lanes};
+}
+
+void FragmentEmitter::Lighting() {
+    const auto& lighting = config.lighting;
+    const Vec4Loc normquat{Bank::PrimAttr, normquat_pa, true};
+    const Vec4Loc view{Bank::PrimAttr, view_pa, true};
+    const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
+    const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
+    const Vec4Loc normal{Bank::Virtual, TmpNormal};
+    const Vec4Loc tangent{Bank::Virtual, TmpTangent};
+    const Vec4Loc nview{Bank::Virtual, TmpView};
+    const Vec4Loc half_vector{Bank::Virtual, TmpHalf};
+    const Reg dot_product = Reg::V(TmpMisc);   // .x; .y the squared half vector length
+    const Reg misc_hi = Reg::V(TmpMisc + 2);   // .x the attenuation, .y light distance
+    const bool config7 = lighting.config == LightingRegs::LightingConfig::Config7;
+
+    const LitReads lit_reads = LitSumReads();
+    u8_lighting_packed = lit_reads.packed;
+    const bool primary_alpha_read = lit_reads.primary_alpha;
+    const bool secondary_alpha_read = lit_reads.secondary_alpha;
+    const uint32_t secondary_lanes = lit_reads.secondary_lanes;
     // One colour lane of the secondary read (specular.rrr): the specular sum is that lane's, a
     // light's term stored or added in one instruction instead of two. The other lanes stay
     // unwritten: only U8Inputs' packs read the sum, and a lane no argument takes is a byte no SOP
@@ -3939,6 +3992,128 @@ void FragmentEmitter::Lighting() {
             LoadVec4(I0, specular_sum);
             Clamp01(I0);
             StoreVec4(specular_sum, I0);
+        }
+    }
+}
+
+bool FragmentEmitter::PvFresnelRead() const {
+    const auto& lighting = config.lighting;
+    if (!LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) {
+        return false;
+    }
+    const LitReads reads = LitSumReads();
+    return (uses_primary_color && lighting.enable_primary_alpha && reads.primary_alpha) ||
+           (uses_secondary_color && lighting.enable_secondary_alpha && reads.secondary_alpha);
+}
+
+void FragmentEmitter::PvLighting() {
+    // Per-vertex effect lighting (PvEffectEligible): the vertex program made primary.rgb, the
+    // global ambient and every light's ambient and diffuse term summed, unclamped, and N.V at
+    // each corner (vs_usse_gen.cpp, VertexEmitter::PvLighting), iterated as TEXCOORD4's half4.
+    // The specular sum is zero; each alpha is the Fresnel table at the iterated N.V where its
+    // enable_*_alpha asks, else 1. The sums leave in the forms Lighting's do, for what reads them
+    // after (U8Inputs, the F32 combiners).
+    const auto& lighting = config.lighting;
+    const Vec4Loc lit{Bank::PrimAttr, normquat_pa, true};
+    const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
+    const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
+    const LitReads reads = LitSumReads();
+    u8_lighting_packed = reads.packed;
+    const bool fresnel = PvFresnelRead();
+    const bool fresnel_primary =
+        fresnel && uses_primary_color && lighting.enable_primary_alpha && reads.primary_alpha;
+    const bool fresnel_secondary =
+        fresnel && uses_secondary_color && lighting.enable_secondary_alpha && reads.secondary_alpha;
+    // The Fresnel value in TmpLutShared.x, read before the sums: its wait drops the internal
+    // registers. N.V, the varying's w, goes to TmpLutShared.z first, where Lighting keeps its N.V
+    // (a lookup's input is a lane of the unified store).
+    const Src fresnel_value{Reg::V(TmpLutShared), XXXX};
+    if (fresnel_primary || fresnel_secondary) {
+        const Reg nv = Reg::V(TmpLutShared + 2);
+        LoadVec4(I0, lit);
+        e.MoveInternal({nv, 0x1}, {I0, WWWW}, Pred::None, true);
+        // The last light's two-sidedness picks the lookup's form, as at the last light in
+        // Lighting; the scale is a power of two made of one or two factors, as lut_value's.
+        const auto& lut = lighting.lut_fr;
+        const bool two_sided = lighting.lights[lighting.src_num - 1].two_sided_diffuse;
+        const float scale = lut.GetScale();
+        std::array<Src, 2> factors{};
+        u32 factor_count = 0;
+        if (scale == 2.0f) {
+            factors = {Lit(LitTwo)};
+            factor_count = 1;
+        } else if (scale == 4.0f) {
+            factors = {Lit(LitFour)};
+            factor_count = 1;
+        } else if (scale == 8.0f) {
+            factors = {Lit(LitTwo), Lit(LitFour)};
+            factor_count = 2;
+        } else if (scale == 0.5f) {
+            factors = {ConstHalf};
+            factor_count = 1;
+        } else if (scale == 0.25f) {
+            factors = {ConstHalf, ConstHalf};
+            factor_count = 2;
+        } else {
+            DEBUG_ASSERT_MSG(scale == 1.0f, "lighting: LUT scale {}", scale);
+        }
+        const Src* fetch_scale = factor_count > 0 ? &factors[0] : nullptr;
+        // TmpLutShared.y is free here: an unscaled read lands in .x itself.
+        const Dst into{Reg::V(TmpLutShared), 0x1};
+        LightingLutLookup(Sampler::Fresnel, {nv, XXXX}, lut.abs_input, two_sided, into,
+                          fetch_scale, true);
+        for (u32 k = fetch_scale != nullptr ? 1 : 0; k < factor_count; k++) {
+            e.Vec(VecOp::Mul, into, {into.reg, XYZW}, factors[k]);
+        }
+    }
+    // An alpha lane of `sum` (an internal register): the Fresnel value or 1.
+    const auto alpha = [&](Reg sum, bool with_fresnel) {
+        if (with_fresnel) {
+            e.Vec(VecOp::Add, {sum, 0x8}, fresnel_value, ConstZero, Pred::None, true);
+        } else {
+            e.Vec(VecOp::Add, {sum, 0x8}, ConstZero, ConstOne, Pred::None, true);
+        }
+    };
+    // An alpha no argument reads: its byte from lane z (lane w unwritten), as Lighting packs it.
+    constexpr uint8_t xyzz = 0xA4;
+    if (uses_primary_color) {
+        if (u8_lighting_packed && !reads.primary_alpha) {
+            // The colour bytes straight from the iterated F16 lanes (the pack saturates as the
+            // clamp does).
+            e.PackU8F16(Reg::V(TmpU8Diffuse), lit.Pair(0), xyzz);
+        } else {
+            LoadVec4(I0, lit);
+            alpha(I0, fresnel_primary);
+            if (u8_lighting_packed) {
+                e.PackU8(Reg::V(TmpU8Diffuse), I0, I0);
+            } else {
+                // F32 for U8Inputs' packs, which saturate (u8_tev), else clamped here.
+                if (!u8_tev) {
+                    Clamp01(I0);
+                }
+                StoreVec4(diffuse_sum, I0);
+            }
+        }
+    }
+    if (uses_secondary_color) {
+        if (u8_lighting_packed && fresnel_secondary && reads.secondary_lanes == 0) {
+            // No colour lane read: every byte the Fresnel value's, packed from where it lies.
+            e.PackU8(Reg::V(TmpU8Specular), fresnel_value.reg, fresnel_value.reg,
+                     PackSelBroadcast(0));
+        } else {
+            e.MoveInternal({I1, 0xf}, {Reg::C(0), XXXX}, Pred::None, true);
+            if (reads.secondary_alpha) {
+                alpha(I1, fresnel_secondary);
+            }
+            if (u8_lighting_packed) {
+                e.PackU8(Reg::V(TmpU8Specular), I1, I1,
+                         reads.secondary_alpha ? PackSelIdentity : xyzz);
+            } else {
+                if (!u8_tev) {
+                    Clamp01(I1, 0x8);
+                }
+                StoreVec4(specular_sum, I1);
+            }
         }
     }
 }
@@ -5491,7 +5666,9 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     if (!unit_used[0] && config.texture.texture0_type == TextureType::Disabled) {
         CopyVec4({Bank::Virtual, TmpTex0}, {Bank::Const, 0});
     }
-    if (uses_lighting) {
+    if (uses_lighting && Pv()) {
+        PvLighting();
+    } else if (uses_lighting) {
         Lighting();
     }
     if (u8_tev) {
@@ -5582,6 +5759,36 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
 }
 
 } // Anonymous namespace
+
+bool PvEffectEligible(const FSConfig& config) {
+    const auto& lighting = config.lighting;
+    // A shadow only where something applies it (as the emitter's shadow_applied): its alpha, or a
+    // light's term, which the loop below excludes. Monster Hunter XX's mist has the shadow enabled
+    // with nothing taking it.
+    if (!lighting.enable || lighting.bump_mode != LightingRegs::LightingBumpMode::None ||
+        (lighting.enable_shadow && lighting.shadow_alpha) || lighting.src_num < 1 ||
+        lighting.src_num > 2 || config.framebuffer.shadow_rendering) {
+        return false;
+    }
+    // Every light lit by its diffuse and ambient colours alone: directional (its vector the
+    // position normalised, the same at every vertex), unattenuated, unshadowed, and no specular
+    // term, so no table but the Fresnel one (the D0, D1, reflection and spot tables only
+    // multiply the specular colours or the spot attenuation) and no clamp_highlights or
+    // geometric factor to apply.
+    for (u32 i = 0; i < lighting.src_num; i++) {
+        const auto& light = lighting.lights[i];
+        if (!light.directional || light.dist_atten_enable || light.spot_atten_enable ||
+            light.geometric_factor_0 || light.geometric_factor_1 || light.shadow_enable ||
+            !light.specular0_zero || !light.specular1_zero) {
+            return false;
+        }
+    }
+    // The Fresnel table reads N.V, which the vertices give: off, or read there (signed or not).
+    return !(lighting.lut_fr.enable &&
+             LightingRegs::IsLightingSamplerSupported(lighting.config,
+                                                      LightingRegs::LightingSampler::Fresnel)) ||
+           lighting.lut_fr.type == LutInput::NV;
+}
 
 uint32_t SampledTextureUnits(const FSConfig& config) {
     FragmentEmitter emitter{config, 1, std::nullopt};

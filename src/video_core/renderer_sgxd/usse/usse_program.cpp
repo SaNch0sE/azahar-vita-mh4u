@@ -126,6 +126,12 @@ std::string UniformName(const Uniform& uniform) {
         return light("dist_atten_bias");
     case UniformKind::LightDistAttenScale:
         return light("dist_atten_scale");
+    case UniformKind::PvAmbient:
+        return "pv_ambient[" + std::to_string(uniform.index) + "]";
+    case UniformKind::PvLightVector:
+        return "pv_normalize(" + light("position") + ")";
+    case UniformKind::PvLightDiffuse:
+        return "pv_" + light("diffuse");
     }
     UNREACHABLE();
 }
