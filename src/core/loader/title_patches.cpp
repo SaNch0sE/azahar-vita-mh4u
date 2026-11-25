@@ -273,7 +273,7 @@ constexpr std::array title_patches{
     TitlePatch{MonsterHunterXxJpn, Translatable("Fast shadows option"),
                Translatable("Offers the Fast shadows option for this game. It changes nothing by "
                             "itself."),
-               std::span<const PatchWord>{}, nullptr, TuningFastShadows},
+               std::span<const PatchWord>{}, nullptr, TuningFastShadows | TuningGeometryBatches},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),
