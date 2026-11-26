@@ -224,6 +224,21 @@ std::atomic<RenderThread*> live_render_thread{};
 std::atomic<u32> max_screen_skips{2};
 } // namespace
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+namespace {
+/// Tools builds' cpu line: the parse's draws without a geometry program as a merge of indexed
+/// strips would see them (RenderThread::ToolsStrips): 0 the draws, 1 the indexed strips, 2 those
+/// following an indexed strip with nothing changed but the index list's address and count, 3
+/// those refused only by a float uniform upload, 4 by another register, 5 by a program, table or
+/// default attribute change, 6 the joinable ones of 6 vertices or fewer, 7 the joinable ones'
+/// vertices, 8 the joinable ones with 8-bit indices, 9 the runs they make.
+std::array<std::atomic<u64>, 10> tools_strips{};
+} // Anonymous namespace
+u64 RenderThread::ToolsStrips(int which) {
+    return tools_strips[which].load(std::memory_order_relaxed);
+}
+#endif
+
 class RenderThread::ParsedOutput final : public VideoCore::RasterizerInterface {
 public:
     explicit ParsedOutput(RenderThread& t_) : t{t_} {}
@@ -240,6 +255,65 @@ public:
     void FlushAll() override {}
     void ClearAll(bool) override {}
     bool AccelerateDrawBatch(bool is_indexed) override {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        {
+            using Topology = Pica::PipelineRegs::TriangleTopology;
+            static decltype(Pica::RegsInternal::reg_array) last{};
+            static bool last_strip = false, in_run = false;
+            const auto& p = t.parse_pica;
+            const auto& pl = p.regs.internal.pipeline;
+            if (pl.use_gs == Pica::PipelineRegs::UseGS::No) {
+                const bool strip = is_indexed && pl.triangle_topology == Topology::Strip;
+                tools_strips[0].fetch_add(1, std::memory_order_relaxed);
+                tools_strips[1].fetch_add(strip ? 1 : 0, std::memory_order_relaxed);
+                if (strip && last_strip) {
+                    constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
+                    constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
+                    bool regs_same = true;
+                    const auto& regs = p.regs.internal.reg_array;
+                    for (u32 w = 0; w < p.dirty_regs.qwords.size(); w++) {
+                        for (u64 q = p.dirty_regs.qwords[w]; q != 0; q &= q - 1) {
+                            const u32 r = w * 64 + static_cast<u32>(std::countr_zero(q));
+                            if (r != NumReg && r != IndexReg && regs[r] != last[r]) {
+                                regs_same = false;
+                            }
+                        }
+                    }
+                    bool other = false, uniforms = false;
+                    for (const Pica::ShaderSetup* s : {&p.vs_setup, &p.gs_setup}) {
+                        uniforms |= s->uniforms_dirty;
+                        other |= s->code_hi > s->code_lo || s->swizzle_hi > s->swizzle_lo;
+                    }
+                    other |= (p.lighting.lut_dirty & Pica::PicaCore::Lighting::LutAllDirty) != 0 ||
+                             p.fog.lut_dirty || p.proctex.table_dirty != 0 ||
+                             p.default_attributes_changed;
+                    const bool joins = regs_same && !uniforms && !other;
+                    if (joins) {
+                        tools_strips[2].fetch_add(1, std::memory_order_relaxed);
+                        tools_strips[6].fetch_add(pl.num_vertices <= 6 ? 1 : 0,
+                                                  std::memory_order_relaxed);
+                        tools_strips[7].fetch_add(pl.num_vertices, std::memory_order_relaxed);
+                        tools_strips[8].fetch_add(pl.index_array.format == 0 ? 1 : 0,
+                                                  std::memory_order_relaxed);
+                        tools_strips[9].fetch_add(in_run ? 0 : 1, std::memory_order_relaxed);
+                    } else if (regs_same && !other) {
+                        tools_strips[3].fetch_add(1, std::memory_order_relaxed);
+                    } else if (!regs_same) {
+                        tools_strips[4].fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        tools_strips[5].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    in_run = joins;
+                } else {
+                    in_run = false;
+                }
+                last_strip = strip;
+                last = p.regs.internal.reg_array;
+            } else {
+                last_strip = in_run = false;
+            }
+        }
+#endif
         // A geometry draw whose state is the held run's joins it; another draw sends the run first.
         if (t.MergeDraw(is_indexed)) {
             return true;

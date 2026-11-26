@@ -2210,6 +2210,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                                        v);
                         }
                     }
+                    static std::array<u64, 10> last_st{};
+                    std::array<u64, 10> st{};
+                    for (int k = 0; k < 10; k++) {
+                        st[k] = SgxdRenderer::RenderThread::ToolsStrips(k) - last_st[k];
+                        last_st[k] += st[k];
+                    }
+                    sites += fmt::format("; parse strips: draws {} indexed strips {} joinable {} "
+                                         "(of 6 or fewer {}, vertices {}, 8-bit {}, runs {}); "
+                                         "refused by uniforms {} registers {} other {}",
+                                         st[0], st[1], st[2], st[6], st[7], st[8], st[9], st[3],
+                                         st[4], st[5]);
                     sites += fmt::format("; repeats {} us: uniforms {} textures {} pass {} "
                                          "vertex {} fragment {} submit {}; differing:{}",
                                          rp[6], rp[0], rp[1], rp[2], rp[3], rp[4], rp[5], rr);

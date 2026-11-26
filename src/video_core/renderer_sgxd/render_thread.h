@@ -94,6 +94,8 @@ public:
     /// Tools builds' cpu line, since the start: 0 the time running records (us), 1 the draws run, 2
     /// their time (us), 3 asleep waiting for the GPU (us), 4 asleep waiting for records (us).
     [[nodiscard]] static u64 ToolsRenderCounter(int which);
+    /// Tools builds' cpu line: the draws a merge of indexed strips could join (tools_strips).
+    [[nodiscard]] static u64 ToolsStrips(int which);
 #endif
 #endif
     static void SetReadbackHolds(bool on);
