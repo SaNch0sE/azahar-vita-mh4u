@@ -2819,13 +2819,14 @@ void RunReplay(Core::System& system, VitaFrontend::EmuWindowVita& window,
     window.UpdateCurrentFramebufferLayout();
     std::string first;
     SceIoStat st{};
-    if (sceIoGetstat("host0:vprof-replay.txt", &st) < 0) {
+    if (sceIoGetstat(fmt::format("{}vprof-replay.txt", SgxdRenderer::Vprof::VprofDir).c_str(),
+                     &st) < 0) {
         first = ReadWholeFile("app0:replay.txt");
         if (first.empty()) {
             first = "results\nprofile 30\nquit\n";
         }
     }
-    std::string shown = first.empty() ? std::string{"host0:vprof-replay.txt's"} : first;
+    std::string shown = first.empty() ? std::string{"vprof-replay.txt's"} : first;
     std::replace(shown.begin(), shown.end(), '\n', ';');
     LOG_INFO(Frontend, "replay player: {}, first requests {}", capture, shown);
     SgxdRenderer::Vprof::Info("replay", capture.c_str());

@@ -433,7 +433,7 @@ void RunFrame(int limit, u32 stop, bool sync = true, u64* begin = nullptr,
 // idle, and with `present` the screens shown after it as a vblank shows them. Per run (RFRM):
 // the time to hand the frame over (the render thread's work, the memory loads included), the
 // time until the GPU is idle, the memory loads' part, the present's. A capture of the events runs
-// over all of them (Vprof::ProfileStart), a host0:vprof-N.vprof of its own: the runs' GPU
+// over all of them (Vprof::ProfileStart), a vprof-N.vprof of its own: the runs' GPU
 // timeline (frame-replay trace).
 void Profile(Writer& w, u32 n, bool present) {
     Replay& r = R();
@@ -489,14 +489,15 @@ void Restore() {
 
 void Finish(Writer& w, u32 number) {
     std::vector<u8> packed = Common::Compression::CompressDataZSTDDefault(w.bytes);
-    const std::string path = fmt::format("host0:vprof-replay-out-{}.bin", number);
+    const std::string path = fmt::format("{}vprof-replay-out-{}.bin", VprofDir, number);
     if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
         const u32 head[3] = {Tag("VPRY"), 1, static_cast<u32>(w.bytes.size())};
         std::fwrite(head, 4, 3, f);
         std::fwrite(packed.data(), 1, packed.size(), f);
         std::fclose(f);
     }
-    if (std::FILE* f = std::fopen(fmt::format("host0:vprof-replay-done-{}", number).c_str(), "wb")) {
+    if (std::FILE* f =
+            std::fopen(fmt::format("{}vprof-replay-done-{}", VprofDir, number).c_str(), "wb")) {
         std::fclose(f);
     }
     LOG_INFO(Render, "vprof replay: {} written ({} KiB)", path, packed.size() >> 10);
@@ -686,13 +687,14 @@ void Serve(ReplayHost& host, const std::string& capture, const std::string& firs
     for (u32 number = 0;; number++) {
         std::string text = number == 0 ? first : std::string{};
         while (text.empty()) {
-            if (std::FILE* f = std::fopen("host0:vprof-replay.txt", "rb")) {
+            const std::string requests = fmt::format("{}vprof-replay.txt", VprofDir);
+            if (std::FILE* f = std::fopen(requests.c_str(), "rb")) {
                 char buf[4096];
                 while (const std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
                     text.append(buf, n);
                 }
                 std::fclose(f);
-                std::remove("host0:vprof-replay.txt");
+                std::remove(requests.c_str());
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(300));

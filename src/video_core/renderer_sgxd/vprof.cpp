@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
@@ -291,7 +292,15 @@ void WriteFile(Capture& s, u32 start) {
         w.Raw(s.events.data(), n * sizeof(EventRec));
         w.End(r);
     }
-    const std::string path = fmt::format("host0:vprof-{}.vprof", file_number++);
+    sceIoMkdir(std::string{VprofDir}.substr(0, std::string{VprofDir}.size() - 1).c_str(), 0777);
+    // The next number free: captures of earlier runs stay.
+    std::string path;
+    do {
+        path = fmt::format("{}vprof-{}.vprof", VprofDir, file_number++);
+    } while ([&] {
+        SceIoStat st{};
+        return sceIoGetstat(path.c_str(), &st) >= 0;
+    }());
     const u64 t0 = sceKernelGetProcessTimeWide();
     std::scoped_lock lock{s.frame_mutex};
     const std::size_t total = w.Size() + s.frame.Size() + s.blobs.Size();
@@ -316,9 +325,10 @@ void WriteFile(Capture& s, u32 start) {
 }
 
 bool Triggered() {
-    if (std::FILE* f = std::fopen("host0:vprof-trigger", "rb")) {
+    const std::string trigger = fmt::format("{}vprof-trigger", VprofDir);
+    if (std::FILE* f = std::fopen(trigger.c_str(), "rb")) {
         std::fclose(f);
-        std::remove("host0:vprof-trigger");
+        std::remove(trigger.c_str());
         return true;
     }
     return false;
@@ -462,6 +472,14 @@ void Start(Memory::MemorySystem& memory) {
     s.thread = std::thread(Run);
     s.thread.detach();
     LOG_INFO(Render, "vprof: armed");
+}
+
+void RequestCapture() {
+    if (!SgxdFlag("vprof")) {
+        return;
+    }
+    LOG_INFO(Render, "vprof: a capture asked for");
+    S().start_now = true;
 }
 
 bool ProfileStart(Memory::MemorySystem& memory) {

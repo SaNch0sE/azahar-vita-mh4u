@@ -38,6 +38,7 @@
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/vprof.h"
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 
 namespace VitaFrontend {
@@ -525,6 +526,20 @@ void EmuWindowVita::ReadPad() {
             menu_held.fetch_or(pad.buttons & ~SCE_CTRL_PSBUTTON, std::memory_order_relaxed);
         }
         buttons_held.store(pad.buttons, std::memory_order_release);
+#ifdef VITA_DIAGNOSTICS
+        // L + R + SELECT: a vprof capture of the frame on screen (sgxd_flags `vprof`), once a
+        // press, for a moment the player sees but cannot set up again.
+        {
+            constexpr u32 Combo = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT;
+            static bool combo_down = false;
+            const bool down = (pad.buttons & Combo) == Combo;
+            if (down && !combo_down) {
+                LOG_INFO(Frontend, "vprof: L + R + SELECT");
+                SgxdRenderer::Vprof::RequestCapture();
+            }
+            combo_down = down;
+        }
+#endif
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
         right_x.store(pad.rx, std::memory_order_relaxed);

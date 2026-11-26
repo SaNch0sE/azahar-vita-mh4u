@@ -25,10 +25,11 @@ class MemorySystem;
  *   memory it read, plus each draw's registers. Replaying the register writes over that memory
  *   is replaying the frame, on the console or on the host through upstream's software renderer.
  *
- * The capture starts `vprof_at` seconds (default 10) after the renderer, or when host0 holds
- * vprof-trigger (polled every second with `vprof_trigger`), and lasts `vprof_len` seconds
- * (default 2); the frame is the first whole one inside it. The layout is
- * tools/frame_replay/FORMAT.md.
+ * The capture starts `vprof_at` seconds (default 10) after the renderer, or when VprofDir holds
+ * vprof-trigger (polled every second with `vprof_trigger`), or at RequestCapture (the player's
+ * L + R + SELECT), and lasts `vprof_len` seconds (default 2); the frame is the first whole one
+ * inside it. The files go to VprofDir on the memory card (a retail console has no host0). The
+ * layout is tools/frame_replay/FORMAT.md.
  */
 // Without VITA_DIAGNOSTICS every function below is an inline no-op, and the release build
 // compiles none of vprof's sources (video_core/CMakeLists.txt).
@@ -38,6 +39,11 @@ namespace SgxdRenderer::Vprof {
 
 /// The capture thread, from the renderer's start (idempotent; nothing without the flag).
 void Start(Memory::MemorySystem& memory);
+/// The captures', the replay's requests' and its results' folder.
+inline constexpr const char* VprofDir = "ux0:data/azahar/vprof/";
+/// A capture as soon as the capture thread sees it (with `vprof`): the frame on screen now, as
+/// the player asks for it (EmuWindowVita: L + R + SELECT).
+void RequestCapture();
 void Event(const char* tag, u32 arg);
 
 /// Whether the frame is being recorded: the hooks below are cheap no-ops otherwise.
@@ -96,6 +102,7 @@ void FrameResult(u32 kind, u32 addr, u32 width, u32 height, u32 format, const u8
 #else
 
 inline void Start(Memory::MemorySystem&) {}
+inline void RequestCapture() {}
 inline void Event(const char*, u32) {}
 inline bool Recording() {
     return false;
