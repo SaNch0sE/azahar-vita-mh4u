@@ -11,11 +11,12 @@
 #include <utility>
 #include <vector>
 #include <fmt/format.h>
+#include <algorithm>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include "common/assert.h"
-#include "common/build_id.h"
 #include "common/file_util.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -24,6 +25,7 @@
 #include "common/thread.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/sgxd_shader_disk_cache.h"
+#include "sgxd_shader_version.h"
 
 namespace SgxdRenderer {
 
@@ -111,11 +113,59 @@ std::size_t Records(const u8* bytes, std::size_t size, bool& stop, F&& record) {
     return at;
 }
 
+/// The title's older caches of this kind (other versions: each update that changed the shader
+/// sources made one) removed, all but the KeptVersions used last; the open one is never removed.
+/// A folder holds its `programs` file alone.
+constexpr std::size_t KeptVersions = 3;
+void RemoveOldVersions(const std::string& open_path) {
+    const std::string open_dir = open_path.substr(0, open_path.rfind('/'));
+    const std::string open_name = open_dir.substr(open_dir.rfind('/') + 1);
+    const std::string prefix = open_name.substr(0, open_name.rfind('.') + 1); // title.kind.
+    struct Found {
+        std::string name;
+        u64 time;
+    };
+    std::vector<Found> found;
+    const SceUID dir = sceIoDopen(Directory);
+    if (dir < 0) {
+        return;
+    }
+    SceIoDirent entry{};
+    while (sceIoDread(dir, &entry) > 0) {
+        const std::string name = entry.d_name;
+        if (name == open_name || !name.starts_with(prefix) || !SCE_S_ISDIR(entry.d_stat.st_mode)) {
+            continue;
+        }
+        const SceDateTime& t = entry.d_stat.st_mtime;
+        const u64 time = ((((u64{t.year} * 13 + t.month) * 32 + t.day) * 24 + t.hour) * 60 +
+                          t.minute) * 60 + t.second;
+        found.push_back({name, time});
+    }
+    sceIoDclose(dir);
+    // The open version counts as one of those kept.
+    if (found.size() + 1 <= KeptVersions) {
+        return;
+    }
+    std::sort(found.begin(), found.end(),
+              [](const Found& a, const Found& b) { return a.time > b.time; });
+    std::size_t removed = 0;
+    for (std::size_t k = KeptVersions - 1; k < found.size(); k++) {
+        const std::string folder = fmt::format("{}/{}", Directory, found[k].name);
+        sceIoRemove((folder + "/programs").c_str());
+        if (sceIoRmdir(folder.c_str()) >= 0) {
+            removed++;
+        }
+    }
+    LOG_INFO(Render, "sgxd: shader cache: {} older version(s) of {} removed, {} kept", removed,
+             prefix, KeptVersions);
+}
+
 /// The loader: the file's programs read into memory. A file whose records end before it does (a
 /// stop cut its last write short, or the card damaged one: its checksum) is cut back to them.
 void Load(std::stop_token stop) {
     Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
     Shared& s = State();
+    RemoveOldVersions(s.path);
     const SceInt64 start = sceKernelGetProcessTimeWide();
     u64 whole = 0, size = 0;
     bool removed = false;
@@ -220,11 +270,11 @@ void ShaderDiskCache::Open(u64 title_id) {
     if (!Settings::values.use_disk_shader_cache.GetValue() || title_id == 0) {
         return;
     }
-    const std::span<const u8> build = Common::BuildId();
-    ASSERT_MSG(!build.empty(), "sgxd: the shader cache's version is the build ID, and this "
-                               "executable was linked without one");
+    // The version: the sources that decide the programs and their keys (SGXD_SHADER_CACHE_VERSION,
+    // CMakeModules/SgxdShaderCacheVersion.cmake), not the build: an update that leaves them alone
+    // keeps the player's programs. The flags too (a flag may change what a program does).
     const std::string flags = SgxdFlagsText();
-    const u64 version = Common::ComputeHash64(build.data(), build.size()) ^
+    const u64 version = SGXD_SHADER_CACHE_VERSION ^
                         Common::ComputeHash64(flags.data(), flags.size());
     const std::string directory =
         fmt::format("{}/{:016x}.{}.{:016x}", Directory, title_id, BuildKind, version);

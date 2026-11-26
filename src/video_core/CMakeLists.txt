@@ -122,6 +122,48 @@ if (ENABLE_VITA_DIAGNOSTICS)
     )
 endif()
 # sgxd_recipe.h takes the op list's types from the module's sgxd.h, plain C on any host.
+# The shader cache's version: a hash of what decides the programs it holds and their keys
+# (CMakeModules/SgxdShaderCacheVersion.cmake), so an update that does not touch them keeps it.
+set(SGXD_SHADER_VERSION_FILES
+    video_core/renderer_sgxd/usse/fs_usse_gen.cpp
+    video_core/renderer_sgxd/usse/fs_usse_gen.h
+    video_core/renderer_sgxd/usse/usse_encoder.cpp
+    video_core/renderer_sgxd/usse/usse_encoder.h
+    video_core/renderer_sgxd/usse/usse_ir.cpp
+    video_core/renderer_sgxd/usse/usse_ir.h
+    video_core/renderer_sgxd/usse/usse_program.cpp
+    video_core/renderer_sgxd/usse/usse_program.h
+    video_core/renderer_sgxd/usse/vs_usse_gen.cpp
+    video_core/renderer_sgxd/usse/vs_usse_gen.h
+    video_core/renderer_sgxd/sgxd_rasterizer.cpp
+    video_core/renderer_sgxd/sgxd_rasterizer.h
+    video_core/renderer_sgxd/sgxd_shader_disk_cache.cpp
+    video_core/renderer_sgxd/sgxd_shader_disk_cache.h
+    video_core/renderer_sgxd/sgxd_shader_tier.cpp
+    video_core/renderer_sgxd/sgxd_shader_tier.h
+    video_core/shader/generator/pica_fs_config.cpp
+    video_core/shader/generator/pica_fs_config.h
+    video_core/shader/generator/shader_gen.h
+    sgxd/sgxd_program.c
+    sgxd/sgxd_program.h
+    sgxd/sgxd_usse_enc.h
+)
+set(SGXD_SHADER_VERSION_H ${CMAKE_CURRENT_BINARY_DIR}/generated/sgxd_shader_version.h)
+set(SGXD_SHADER_VERSION_DEPS "")
+foreach(f IN LISTS SGXD_SHADER_VERSION_FILES)
+    list(APPEND SGXD_SHADER_VERSION_DEPS ${CMAKE_SOURCE_DIR}/src/${f})
+endforeach()
+add_custom_command(
+    OUTPUT ${SGXD_SHADER_VERSION_H}
+    COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}/src -DOUT=${SGXD_SHADER_VERSION_H}
+            "-DFILES=${SGXD_SHADER_VERSION_FILES}"
+            -P ${CMAKE_SOURCE_DIR}/CMakeModules/SgxdShaderCacheVersion.cmake
+    DEPENDS ${SGXD_SHADER_VERSION_DEPS} ${CMAKE_SOURCE_DIR}/CMakeModules/SgxdShaderCacheVersion.cmake
+    COMMENT "sgxd shader cache version"
+    VERBATIM)
+target_sources(video_core PRIVATE ${SGXD_SHADER_VERSION_H})
+target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
 target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd
                                               ${CMAKE_SOURCE_DIR}/vita_native/src)
 # The precompiled header is C++; a C file given it makes CMake build a C one from it. The
