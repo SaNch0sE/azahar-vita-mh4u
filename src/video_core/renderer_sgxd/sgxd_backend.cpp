@@ -2577,6 +2577,25 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
         SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN, CacheSite::Vertices);
     }
     SgxdSessionRender render{};
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // The slow-frame recorder's frame: each pass alone, its TA and 3D times kept.
+    if (tools_timing) {
+        sgxd_session_time_renders = 1;
+        RenderSync(r, &render.ta_us, &render.d3_us);
+        sgxd_session_time_renders = 0;
+        CloseData(r.fence = pass_fences[passes % PassFences] = FenceAll());
+        tools_pass_times.push_back({passes - 1, pass_target.lo, r.width, r.height, draw_count,
+                                    render.ta_us, render.d3_us});
+        if (ta_us) {
+            *ta_us = render.ta_us;
+        }
+        if (d3_us) {
+            *d3_us = render.d3_us;
+        }
+        give_back();
+        return;
+    }
+#endif
 #ifdef VITA_DIAGNOSTICS
     static const bool sync_passes = SgxdFlag("syncpasses");
     if (sync_passes || replay_sync || Vprof::FrameSync()) {
@@ -3636,6 +3655,21 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     stream_renders_sent++;
 #endif
     queued.clear();
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // The slow-frame recorder's frame: each stream-out render on its own, timed.
+    if (tools_timing) {
+        u32 ta = 0, d3 = 0;
+        sgxd_session_time_renders = 1;
+        RenderSync(r, &ta, &d3);
+        sgxd_session_time_renders = 0;
+        auto& t = tools_stream_times[&queued == &stream_draws[0] ? 0 : tools_stream_trail ? 2 : 1];
+        t[0]++;
+        t[1] += draws;
+        t[2] += ta;
+        t[3] += d3;
+        return;
+    }
+#endif
     if (wait) {
         RenderSync(r, nullptr, nullptr);
         return;

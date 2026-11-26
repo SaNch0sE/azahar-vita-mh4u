@@ -122,6 +122,11 @@ void sgxd_session_render_async_result(SgxdSessionRender *render);
 // state and the last render list's registers against its values.
 void sgxd_session_render_async_failed(char *failed, unsigned failed_size);
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+// Tools builds: nonzero while the slow-frame recorder times its frame (SgxdBackend::tools_timing):
+// sgxd_session_render then fills ta_us and d3_us as the diagnostics build does.
+extern int sgxd_session_time_renders;
+#endif
 int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *failed,
                         unsigned failed_size);
 

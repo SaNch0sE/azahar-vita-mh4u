@@ -2357,6 +2357,66 @@ void RasterizerSgxd::NoteStreamOut(const char* stage, u32 mode, u32 invocations,
 
 #endif
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+void RasterizerSgxd::ToolsTimingStart(u32 gap_ms) {
+    tools_tally.clear();
+    backend.tools_pass_times.clear();
+    backend.tools_stream_times = {};
+    backend.tools_timing = true;
+    tools_trigger_gap = gap_ms;
+}
+
+void RasterizerSgxd::ToolsTimingEnd() {
+    backend.tools_timing = false;
+    auto times = backend.tools_pass_times;
+    u32 ta = 0, d3 = 0, draws = 0;
+    for (const auto& t : times) {
+        ta += t.ta_us;
+        d3 += t.d3_us;
+        draws += t.draws;
+    }
+    tools_timed_frames++;
+    LOG_INFO(Render,
+             "slow frame {}: after a {} ms present gap; {} passes, {} draws, GPU TA {:.1f} ms 3D "
+             "{:.1f} ms",
+             tools_timed_frames, tools_trigger_gap, times.size(), draws, ta / 1000.0, d3 / 1000.0);
+    {
+        const auto& s = backend.tools_stream_times;
+        LOG_INFO(Render,
+                 "slow frame {}: stream-out A0 {} renders {} draws TA {:.2f} ms; A1 {} renders {} "
+                 "draws TA {:.2f} ms; trails {} renders TA {:.2f} ms",
+                 tools_timed_frames, s[0][0], s[0][1], s[0][2] / 1000.0, s[1][0], s[1][1],
+                 s[1][2] / 1000.0, s[2][0], s[2][2] / 1000.0);
+    }
+    std::sort(times.begin(), times.end(),
+              [](const auto& a, const auto& b) { return a.d3_us + a.ta_us > b.d3_us + b.ta_us; });
+    for (std::size_t k = 0; k < times.size() && k < 6; k++) {
+        const auto& t = times[k];
+        std::vector<ToolsDrawTally> programs;
+        for (const auto& d : tools_tally) {
+            if (d.pass == t.pass) {
+                programs.push_back(d);
+            }
+        }
+        std::sort(programs.begin(), programs.end(),
+                  [](const auto& a, const auto& b) { return a.draws > b.draws; });
+        std::string list;
+        for (std::size_t p = 0; p < programs.size() && p < (k < 2 ? 10u : 4u); p++) {
+            list += fmt::format(" {:08x}:{}{}", static_cast<u32>(programs[p].key), programs[p].draws,
+                                programs[p].translucent != 0
+                                    ? fmt::format("t{}", programs[p].translucent)
+                                    : std::string{});
+        }
+        LOG_INFO(Render,
+                 "slow frame {}: pass {} target {:#x} {}x{}: {} draws, TA {:.2f} ms 3D {:.2f} ms;"
+                 " {} programs:{}",
+                 tools_timed_frames, t.pass, t.target, t.width, t.height, t.draws,
+                 t.ta_us / 1000.0, t.d3_us / 1000.0, programs.size(), list);
+    }
+    tools_tally.clear();
+}
+#endif
+
 void RasterizerSgxd::KeepGsRows(u32 begin, u32 end) {
     for (u32 r = 0; r < 16; r++) {
         const u32 row = gs_last_rows[r] + 4;
@@ -5643,7 +5703,13 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         }
         backend.StreamOut(p, a1.count, SgxdBackend::StreamStage::A1, wait);
         if (serial && !wait) {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+            backend.tools_stream_trail = trails;
+#endif
             backend.FlushStreamOut(false);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+            backend.tools_stream_trail = false;
+#endif
         }
 #ifdef VITA_DIAGNOSTICS
         stream_note.stage = nullptr;
@@ -9154,6 +9220,22 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         translucent = !keep_alpha_opaque;
         (keep_alpha_opaque ? keep_alpha_opaques : keep_alpha_translucents)++;
     }
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // The slow-frame recorder's frame: the draw's fragment program counted with its pass.
+    if (backend.tools_timing) {
+        const u32 pass = backend.ToolsPassNumber();
+        auto it = std::find_if(tools_tally.begin(), tools_tally.end(), [&](const auto& t) {
+            return t.pass == pass && t.key == last_fragment_key;
+        });
+        if (it == tools_tally.end()) {
+            tools_tally.push_back({pass, last_fragment_key, 0, 0, 0});
+            it = tools_tally.end() - 1;
+        }
+        it->draws++;
+        it->translucent += translucent ? 1 : 0;
+        it->vertices += stage.count;
+    }
+#endif
 #ifdef VITA_DIAGNOSTICS
     // A recorded frame's draw (vprof) and its fragment program's dumpusse key.
     if (vprof_draw_noted) {

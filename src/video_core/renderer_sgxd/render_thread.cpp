@@ -4394,6 +4394,26 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             break;
         }
         const auto now = Clock::now();
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        // The slow-frame recorder: a present past 45 ms after the last times the next frame's
+        // passes one by one (RasterizerSgxd::ToolsTimingStart), logged at the present after it;
+        // at most one frame a second, and none after a pause (a load, the menu).
+        {
+            static Clock::time_point last_seen{}, last_timed{};
+            static bool timing = false;
+            const auto gap =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_seen).count();
+            last_seen = now;
+            if (timing) {
+                rasterizer.ToolsTimingEnd();
+                timing = false;
+            } else if (gap > 45 && gap < 400 && now - last_timed > std::chrono::seconds(1)) {
+                rasterizer.ToolsTimingStart(static_cast<u32>(gap));
+                timing = true;
+                last_timed = now;
+            }
+        }
+#endif
 #if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
         // The time between the presents as the render thread reaches them (TakePaceGaps).
         {

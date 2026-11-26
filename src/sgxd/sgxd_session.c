@@ -154,7 +154,7 @@ uint32_t sgxd_session_renders(void) {
     return renders;
 }
 
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
 // The diagnostics build times the TA and the 3D: it spins on core 0's EVENT_STATUS until bit
 // is set (or a second passed) and returns the time of that read; the kernel's poll sleeps
 // ~220 us after 100 us, which would time every small pass the same.
@@ -176,6 +176,7 @@ static uint64_t spin_until(uint32_t bit) {
 // Tools builds: each synchronous render's time from its kick to its 3D's end (the caller waits all
 // of it), in the GPU wait counter (sgxd_wait_us_take).
 static uint64_t tools_render_start;
+int sgxd_session_time_renders;
 #endif
 
 int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *failed,
@@ -189,6 +190,11 @@ int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *fa
 #ifdef VITA_DIAGNOSTICS
     const uint64_t t0 = sceKernelGetProcessTimeWide();
     const uint64_t t1 = spin_until(0x2000);
+#elif defined(VITA_DEBUG_TOOLS)
+    // Tools builds time a render only for the slow-frame recorder (sgxd_session_time_renders).
+    const int timed = sgxd_session_time_renders;
+    const uint64_t t0 = timed ? sceKernelGetProcessTimeWide() : 0;
+    const uint64_t t1 = timed ? spin_until(0x2000) : 0;
 #endif
     if (sgxd_session_phase(r, sgxd_session_ta_wait, "ta wait", failed, failed_size) < 0) {
         return -1;
@@ -207,6 +213,9 @@ int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *fa
 #ifdef VITA_DIAGNOSTICS
     const uint64_t t2 = sceKernelGetProcessTimeWide();
     const uint64_t t3 = spin_until(0x40000);
+#elif defined(VITA_DEBUG_TOOLS)
+    const uint64_t t2 = timed ? sceKernelGetProcessTimeWide() : 0;
+    const uint64_t t3 = timed ? spin_until(0x40000) : 0;
 #endif
     if (sgxd_session_phase(r, sgxd_session_3d_wait, "3d wait", failed, failed_size) < 0) {
         return -1;
@@ -224,6 +233,10 @@ int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *fa
     render->ta_us = 0;
     render->d3_us = 0;
 #ifdef VITA_DEBUG_TOOLS
+    if (timed) {
+        render->ta_us = (uint32_t)(t1 - t0);
+        render->d3_us = (uint32_t)(t3 - t2);
+    }
     sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - tools_render_start));
 #endif
 #endif

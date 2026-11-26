@@ -1210,6 +1210,22 @@ public:
     [[nodiscard]] static std::string ToolsWaitSites();
     /// Tools builds' cpu line: the Kind::Stream recipes made since the start.
     [[nodiscard]] static u32 ToolsStreamRecipes();
+    /// Tools builds' slow-frame recorder (RenderThread): while set, each pass is rendered on its
+    /// own, synchronously, and its GPU times kept in tools_pass_times.
+    bool tools_timing{};
+    struct ToolsPassTime {
+        u32 pass, target, width, height, draws, ta_us, d3_us;
+    };
+    std::vector<ToolsPassTime> tools_pass_times;
+    /// The timed frame's stream-out renders, summed: [0] A0, [1] A1, [2] A1 of trails (the
+    /// rasterizer sets tools_stream_trail around a trail draw's flush): renders, draws, TA us,
+    /// 3D us.
+    std::array<std::array<u32, 4>, 3> tools_stream_times{};
+    bool tools_stream_trail{};
+    /// The open pass's number (a closed pass's in tools_pass_times).
+    [[nodiscard]] u32 ToolsPassNumber() const {
+        return passes;
+    }
 #endif
 private:
 
