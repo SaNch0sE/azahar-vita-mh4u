@@ -1865,8 +1865,8 @@ void Ui::BuildRows() {
          Translatable("Even frame pacing (experimental)"),
          Translatable("Experimental. Shows the game's pictures at an even beat of two refreshes: "
                       "one that is ready early waits for its turn. For a game that runs at 30 "
-                      "frames a second and still looks choppy. It works with Vsync on, and can "
-                      "show a picture up to two refreshes (33 ms) later."),
+                      "frames a second and still looks choppy. It works with Vsync on, and shows "
+                      "each picture about one refresh (17 ms) later."),
          {},
          0,
          nullptr,

@@ -297,8 +297,8 @@ constexpr std::array table{std::to_array<Translation>({
      "在半透明特效（如雾气和烟尘）的顶点处计算光照，而不是在每个像素上计算。它们看起来可能略有不同；当这类特效覆盖屏幕时，GPU 的工作量会大大减少。"},
     {"Experimental. Shows the game's pictures at an even beat of two refreshes: one that is ready "
      "early waits for its turn. For a game that runs at 30 frames a second and still looks choppy. "
-     "It works with Vsync on, and can show a picture up to two refreshes (33 ms) later.",
-     "实验性功能。以每两次刷新一帧的均匀节奏显示游戏画面：提前完成的画面会等待自己的时机。适用于以每秒 30 帧运行但仍显得卡顿的游戏。需要开启垂直同步，画面最多可能晚两次刷新（33 毫秒）显示。"},
+     "It works with Vsync on, and shows each picture about one refresh (17 ms) later.",
+     "实验性功能。以每两次刷新一帧的均匀节奏显示游戏画面：提前完成的画面会等待自己的时机。适用于以每秒 30 帧运行但仍显得卡顿的游戏。需要开启垂直同步，每个画面大约晚一次刷新（17 毫秒）显示。"},
     {"HUD resolution", "HUD 分辨率"},
     {"Draws the top screen's HUD, text and menus at a higher resolution over the 3D picture, which "
      "stays at the internal resolution: sharper text for little GPU work. It applies above the "
