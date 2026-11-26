@@ -128,6 +128,11 @@ public:
     [[nodiscard]] static u64 ToolsDrawUs(int which);
     /// Tools builds' cpu line: how geometry draws could be merged (tools_merge).
     [[nodiscard]] static u64 ToolsMerge(int which);
+    /// Tools builds' cpu line: the repeat draws' time by stage (as ToolsDrawUs), 6 their count.
+    [[nodiscard]] static u64 ToolsRepeatUs(int which);
+    /// Tools builds' cpu line: the repeat draws by register 0x200 + i of theirs that differs from
+    /// the draw before's (i < 64), 64 the indexed ones, 65-68 by topology.
+    [[nodiscard]] static u32 ToolsRepeatRegs(int which);
     /// Tools builds' cpu line, since the start: GeometryStage's us by part (0-4).
     [[nodiscard]] static u64 ToolsGeometryPartUs(int which);
     struct ToolsDrawSections {
@@ -136,6 +141,9 @@ public:
         void Mark(int stage);
         u64 last;
         int next = 0;
+        /// This draw's time by stage, and whether it repeats the draw before (ToolsMergeNote).
+        std::array<u64, 6> spent{};
+        bool repeat = false;
     };
     /// Tools builds' slow-frame recorder (RenderThread): from Start to End (a present to the
     /// next), every pass rendered on its own and timed (SgxdBackend::tools_timing) and each

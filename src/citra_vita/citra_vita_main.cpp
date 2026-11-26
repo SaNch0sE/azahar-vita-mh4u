@@ -2190,6 +2190,29 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          "(uniforms equal {})",
                                          mg[0], mg[1], mg[2], mg[3], mg[4], mg[5], mg[6], mg[7],
                                          mg[8], mg[9], mg[10], mg[11], mg[12]);
+                    static std::array<u64, 7> last_rep{};
+                    std::array<u64, 7> rp{};
+                    for (int k = 0; k < 7; k++) {
+                        rp[k] = SgxdRenderer::RasterizerSgxd::ToolsRepeatUs(k) - last_rep[k];
+                        last_rep[k] += rp[k];
+                    }
+                    static std::array<u32, 69> last_rr{};
+                    std::string rr;
+                    for (int k = 0; k < 69; k++) {
+                        const u32 v = SgxdRenderer::RasterizerSgxd::ToolsRepeatRegs(k) - last_rr[k];
+                        last_rr[k] += v;
+                        if (v != 0) {
+                            rr += k < 64 ? fmt::format(" {:x}:{}", 0x200 + k, v)
+                                         : fmt::format(" {}:{}",
+                                                       k == 64 ? "indexed" : k == 65 ? "list"
+                                                                 : k == 66 ? "strip"
+                                                                 : k == 67 ? "fan" : "shader",
+                                                       v);
+                        }
+                    }
+                    sites += fmt::format("; repeats {} us: uniforms {} textures {} pass {} "
+                                         "vertex {} fragment {} submit {}; differing:{}",
+                                         rp[6], rp[0], rp[1], rp[2], rp[3], rp[4], rp[5], rr);
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
                              sgxd_wait_us_take() / 1000, renders - last_renders, sites);

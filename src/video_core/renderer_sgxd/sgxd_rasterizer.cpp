@@ -5125,12 +5125,16 @@ struct ToolsUsTimer {
 /// 5-8 the runs of following draws by length (1, 2-3, 4-7, 8 or more), 9 the draws in runs of 2 or
 /// more; 10-12 as 0-2 for the draws without a geometry program.
 std::array<std::atomic<u64>, 13> tools_merge{};
-void ToolsMergeNote(const Pica::RegsInternal& regs, Pica::ShaderSetup& gs, Pica::ShaderSetup& vs,
-                    bool use_gs) {
+std::array<std::atomic<u64>, 7> tools_repeat_us{};
+std::array<std::atomic<u32>, 69> tools_repeat_regs{};
+/// Whether the draw repeats the one before: no geometry program, the same state and float uniforms.
+bool ToolsMergeNote(const Pica::RegsInternal& regs, Pica::ShaderSetup& gs, Pica::ShaderSetup& vs,
+                    bool use_gs, bool indexed) {
     static u64 last_state = 0;
     static bool last_gs = false;
     static u32 run = 0;
     static std::array<Common::Vec4<f24>, 96> last_gf{}, last_vf{};
+    static std::array<u32, 64> last_vertex_regs{};
     const auto end_run = [] {
         if (run != 0) {
             tools_merge[run == 1 ? 5 : run <= 3 ? 6 : run <= 7 ? 7 : 8].fetch_add(
@@ -5152,14 +5156,27 @@ void ToolsMergeNote(const Pica::RegsInternal& regs, Pica::ShaderSetup& gs, Pica:
         hv = Common::HashCombine(hv, Common::ComputeHash64(&vs.uniforms.b, sizeof(vs.uniforms.b) +
                                                                                sizeof(vs.uniforms.i)));
         tools_merge[10].fetch_add(1, std::memory_order_relaxed);
+        bool repeat = false;
         if (!last_gs && last_state == hv) {
+            repeat = vs.uniforms.f == last_vf;
             tools_merge[11].fetch_add(1, std::memory_order_relaxed);
-            tools_merge[12].fetch_add(vs.uniforms.f == last_vf ? 1 : 0, std::memory_order_relaxed);
+            tools_merge[12].fetch_add(repeat ? 1 : 0, std::memory_order_relaxed);
         }
+        if (repeat) {
+            for (u32 k = 0; k < 64; k++) {
+                if (r[0x200 + k] != last_vertex_regs[k]) {
+                    tools_repeat_regs[k].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            tools_repeat_regs[64].fetch_add(indexed ? 1 : 0, std::memory_order_relaxed);
+            tools_repeat_regs[65 + (static_cast<u32>(regs.pipeline.triangle_topology.Value()) & 3)].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        std::memcpy(last_vertex_regs.data(), r.data() + 0x200, sizeof(last_vertex_regs));
         last_state = hv;
         last_gs = false;
         last_vf = vs.uniforms.f;
-        return;
+        return repeat;
     }
     u64 h = Common::ComputeHash64(r.data(), 0x200 * sizeof(u32));
     h = Common::HashCombine(h, Common::ComputeHash64(r.data() + 0x240, 0x50 * sizeof(u32)));
@@ -5192,11 +5209,20 @@ void ToolsMergeNote(const Pica::RegsInternal& regs, Pica::ShaderSetup& gs, Pica:
     last_gs = true;
     last_gf = gs.uniforms.f;
     last_vf = vs.uniforms.f;
+    return false;
 }
 } // Anonymous namespace
 
 u64 RasterizerSgxd::ToolsMerge(int which) {
     return tools_merge[which].load(std::memory_order_relaxed);
+}
+
+u64 RasterizerSgxd::ToolsRepeatUs(int which) {
+    return tools_repeat_us[which].load(std::memory_order_relaxed);
+}
+
+u32 RasterizerSgxd::ToolsRepeatRegs(int which) {
+    return tools_repeat_regs[which].load(std::memory_order_relaxed);
 }
 
 u32 RasterizerSgxd::ToolsGeometryDraws(int which) {
@@ -5223,14 +5249,23 @@ RasterizerSgxd::ToolsDrawSections::ToolsDrawSections() : last(sceKernelGetProces
 
 void RasterizerSgxd::ToolsDrawSections::Mark(int stage) {
     const u64 now = sceKernelGetProcessTimeWide();
-    tools_draw_us[stage].fetch_add(now - last, std::memory_order_relaxed);
+    spent[stage] += now - last;
     last = now;
     next = stage + 1;
 }
 
 RasterizerSgxd::ToolsDrawSections::~ToolsDrawSections() {
-    tools_draw_us[next].fetch_add(sceKernelGetProcessTimeWide() - last, std::memory_order_relaxed);
+    spent[next] += sceKernelGetProcessTimeWide() - last;
+    for (int k = 0; k < 6; k++) {
+        tools_draw_us[k].fetch_add(spent[k], std::memory_order_relaxed);
+        if (repeat) {
+            tools_repeat_us[k].fetch_add(spent[k], std::memory_order_relaxed);
+        }
+    }
     tools_draw_us[6].fetch_add(1, std::memory_order_relaxed);
+    if (repeat) {
+        tools_repeat_us[6].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 #endif
 
@@ -9371,8 +9406,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // to light it; the fragment program follows what that program does.
     const u32 pv_request = PvEffectRequest(blend);
 #if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
-    ToolsMergeNote(regs, pica.gs_setup, pica.vs_setup,
-                   pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes);
+    tools_sections.repeat = ToolsMergeNote(regs, pica.gs_setup, pica.vs_setup,
+                                           pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes,
+                                           is_indexed);
 #endif
     const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
                                   ? GeometryStage(is_indexed, describe)
