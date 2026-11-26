@@ -2177,6 +2177,19 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          (draw_us[5] - last_draw_us[5]) / 1000,
                                          draw_us[6] - last_draw_us[6]);
                     last_draw_us = draw_us;
+                    static std::array<u64, 13> last_merge{};
+                    std::array<u64, 13> mg{};
+                    for (int k = 0; k < 13; k++) {
+                        mg[k] = SgxdRenderer::RasterizerSgxd::ToolsMerge(k) - last_merge[k];
+                        last_merge[k] += mg[k];
+                    }
+                    sites += fmt::format("; merge: geometry draws {}, following a same-state one "
+                                         "{} (uniforms equal {}; differing vec4s gs {} vs {}), "
+                                         "runs 1:{} 2-3:{} 4-7:{} 8+:{} ({} draws in runs); "
+                                         "other draws {}, following a same-state one {} "
+                                         "(uniforms equal {})",
+                                         mg[0], mg[1], mg[2], mg[3], mg[4], mg[5], mg[6], mg[7],
+                                         mg[8], mg[9], mg[10], mg[11], mg[12]);
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
                              sgxd_wait_us_take() / 1000, renders - last_renders, sites);

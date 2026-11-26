@@ -5117,7 +5117,87 @@ struct ToolsUsTimer {
         sum.fetch_add(sceKernelGetProcessTimeWide() - start, std::memory_order_relaxed);
     }
 };
+/// Tools builds' cpu line: how geometry draws could be merged. A geometry draw "follows" the one
+/// before when that one was a geometry draw too with the same state: the registers but the vertex
+/// data's (0x200-0x23f) and the uniform upload ports, both programs, the bool and int uniforms.
+/// 0 geometry draws, 1 those following, 2 those following with equal float uniforms too, 3 and 4
+/// the float uniforms (vec4s) differing in those following, the geometry and the vertex program's,
+/// 5-8 the runs of following draws by length (1, 2-3, 4-7, 8 or more), 9 the draws in runs of 2 or
+/// more; 10-12 as 0-2 for the draws without a geometry program.
+std::array<std::atomic<u64>, 13> tools_merge{};
+void ToolsMergeNote(const Pica::RegsInternal& regs, Pica::ShaderSetup& gs, Pica::ShaderSetup& vs,
+                    bool use_gs) {
+    static u64 last_state = 0;
+    static bool last_gs = false;
+    static u32 run = 0;
+    static std::array<Common::Vec4<f24>, 96> last_gf{}, last_vf{};
+    const auto end_run = [] {
+        if (run != 0) {
+            tools_merge[run == 1 ? 5 : run <= 3 ? 6 : run <= 7 ? 7 : 8].fetch_add(
+                1, std::memory_order_relaxed);
+            if (run >= 2) {
+                tools_merge[9].fetch_add(run, std::memory_order_relaxed);
+            }
+        }
+        run = 0;
+    };
+    const auto& r = regs.reg_array;
+    if (!use_gs) {
+        end_run();
+        u64 hv = Common::ComputeHash64(r.data(), 0x200 * sizeof(u32));
+        hv = Common::HashCombine(hv, Common::ComputeHash64(r.data() + 0x240, 0x40 * sizeof(u32)));
+        hv = Common::HashCombine(hv, Common::ComputeHash64(r.data() + 0x2b0, 0x10 * sizeof(u32)));
+        hv = Common::HashCombine(hv, vs.GetProgramCodeHash());
+        hv = Common::HashCombine(hv, vs.GetSwizzleDataHash());
+        hv = Common::HashCombine(hv, Common::ComputeHash64(&vs.uniforms.b, sizeof(vs.uniforms.b) +
+                                                                               sizeof(vs.uniforms.i)));
+        tools_merge[10].fetch_add(1, std::memory_order_relaxed);
+        if (!last_gs && last_state == hv) {
+            tools_merge[11].fetch_add(1, std::memory_order_relaxed);
+            tools_merge[12].fetch_add(vs.uniforms.f == last_vf ? 1 : 0, std::memory_order_relaxed);
+        }
+        last_state = hv;
+        last_gs = false;
+        last_vf = vs.uniforms.f;
+        return;
+    }
+    u64 h = Common::ComputeHash64(r.data(), 0x200 * sizeof(u32));
+    h = Common::HashCombine(h, Common::ComputeHash64(r.data() + 0x240, 0x50 * sizeof(u32)));
+    h = Common::HashCombine(h, Common::ComputeHash64(r.data() + 0x2b0, 0x10 * sizeof(u32)));
+    h = Common::HashCombine(h, gs.GetProgramCodeHash());
+    h = Common::HashCombine(h, gs.GetSwizzleDataHash());
+    h = Common::HashCombine(h, vs.GetProgramCodeHash());
+    h = Common::HashCombine(h, vs.GetSwizzleDataHash());
+    h = Common::HashCombine(h, Common::ComputeHash64(&gs.uniforms.b, sizeof(gs.uniforms.b) +
+                                                                         sizeof(gs.uniforms.i)));
+    h = Common::HashCombine(h, Common::ComputeHash64(&vs.uniforms.b, sizeof(vs.uniforms.b) +
+                                                                         sizeof(vs.uniforms.i)));
+    tools_merge[0].fetch_add(1, std::memory_order_relaxed);
+    if (last_gs && h == last_state) {
+        u32 gd = 0, vd = 0;
+        for (u32 k = 0; k < 96; k++) {
+            gd += std::memcmp(&gs.uniforms.f[k], &last_gf[k], sizeof(last_gf[k])) != 0 ? 1 : 0;
+            vd += std::memcmp(&vs.uniforms.f[k], &last_vf[k], sizeof(last_vf[k])) != 0 ? 1 : 0;
+        }
+        tools_merge[1].fetch_add(1, std::memory_order_relaxed);
+        tools_merge[2].fetch_add(gd + vd == 0 ? 1 : 0, std::memory_order_relaxed);
+        tools_merge[3].fetch_add(gd, std::memory_order_relaxed);
+        tools_merge[4].fetch_add(vd, std::memory_order_relaxed);
+        run++;
+    } else {
+        end_run();
+        run = 1;
+    }
+    last_state = h;
+    last_gs = true;
+    last_gf = gs.uniforms.f;
+    last_vf = vs.uniforms.f;
+}
 } // Anonymous namespace
+
+u64 RasterizerSgxd::ToolsMerge(int which) {
+    return tools_merge[which].load(std::memory_order_relaxed);
+}
 
 u32 RasterizerSgxd::ToolsGeometryDraws(int which) {
     return tools_geometry[which].load(std::memory_order_relaxed);
@@ -9290,6 +9370,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // Per-vertex effect lighting: a blended draw whose lighting allows it asks its vertex program
     // to light it; the fragment program follows what that program does.
     const u32 pv_request = PvEffectRequest(blend);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    ToolsMergeNote(regs, pica.gs_setup, pica.vs_setup,
+                   pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes);
+#endif
     const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
                                   ? GeometryStage(is_indexed, describe)
                                   : VertexStageFor(is_indexed, immediate, count,

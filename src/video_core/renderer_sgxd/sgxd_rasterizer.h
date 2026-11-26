@@ -126,6 +126,8 @@ public:
     [[nodiscard]] static u64 ToolsGeometryUs(int which);
     /// Tools builds' cpu line, since the start: Draw's us by stage (0-5) and its count (6).
     [[nodiscard]] static u64 ToolsDrawUs(int which);
+    /// Tools builds' cpu line: how geometry draws could be merged (tools_merge).
+    [[nodiscard]] static u64 ToolsMerge(int which);
     /// Tools builds' cpu line, since the start: GeometryStage's us by part (0-4).
     [[nodiscard]] static u64 ToolsGeometryPartUs(int which);
     struct ToolsDrawSections {
