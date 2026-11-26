@@ -270,8 +270,8 @@ constexpr std::array title_patches{
                std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
                    TuningEvenPacing | TuningKeepMovedPages | TuningFastShadows |
                    TuningPvEffectLighting},
-    // Monster Hunter XX (Japan): the Fast shadows, Per-vertex effect lighting, Parallel geometry
-    // and HUD resolution options and the geometry shader draws' room; the rest runs as in beta-1.
+    // Monster Hunter XX (Japan): the Fast shadows, Per-vertex effect lighting, Parallel geometry,
+    // HUD resolution and Even frame pacing options and the geometry shader draws' room; the rest runs as in beta-1.
     // Its frame is drawn as MH4U's (the 3D picture with depth, then the HUD without), so the HUD
     // scale applies.
     TitlePatch{MonsterHunterXxJpn, Translatable("Speed options"),
@@ -279,7 +279,8 @@ constexpr std::array title_patches{
                             "and starts it with Fast shadows and Parallel geometry on."),
                std::span<const PatchWord>{}, nullptr,
                TuningFastShadows | TuningGeometryBatches | TuningPvEffectLighting |
-                   TuningKeepMovedPages | TuningParallelGeometry | TuningHudScale},
+                   TuningKeepMovedPages | TuningParallelGeometry | TuningHudScale |
+                   TuningEvenPacing},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),
