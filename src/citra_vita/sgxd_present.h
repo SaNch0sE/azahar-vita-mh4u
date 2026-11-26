@@ -20,7 +20,7 @@ namespace VitaFrontend::SgxdPresent {
 
 /// With vsync on: how many refreshes apart the display took its pictures since the last call, as
 /// counts of one, two, three, and four or more (statslog).
-[[nodiscard]] std::array<u32, 4> TakeFlipGaps();
+[[nodiscard]] std::array<u32, 11> TakeFlipGaps();
 
 inline constexpr u32 DisplayWidth = 960;
 inline constexpr u32 DisplayHeight = 544;

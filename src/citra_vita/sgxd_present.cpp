@@ -42,6 +42,9 @@ namespace {
 /// With vsync on: how many refreshes apart the display took its pictures (TakeFlipGaps): one,
 /// two, three, four or more.
 std::array<std::atomic<u32>, 4> flip_gaps{};
+/// Even pacing: the refreshes the display thread waited for a picture's turn (TakeFlipGaps' last
+/// four: none, one, two, more), and the pictures queued when it was taken (1, 2, 3).
+std::array<std::atomic<u32>, 7> pace_waits{};
 
 // GPU addresses (docs/sgxd/memory.md; sgxd_test's): the recipe's block at 16 MiB,
 // the display buffers at 1 GiB, the texture at 60 MiB.
@@ -931,10 +934,13 @@ void SetQueueMode(bool on) {
 
 // The display thread (vsync): each queued picture set for the next vblank, then waited for until
 // the display has taken it; the picture shown before is free from then on.
-std::array<u32, 4> TakeFlipGaps() {
-    std::array<u32, 4> out{};
+std::array<u32, 11> TakeFlipGaps() {
+    std::array<u32, 11> out{};
     for (u32 k = 0; k < 4; k++) {
         out[k] = flip_gaps[k].exchange(0, std::memory_order_relaxed);
+    }
+    for (u32 k = 0; k < 7; k++) {
+        out[4 + k] = pace_waits[k].exchange(0, std::memory_order_relaxed);
     }
     return out;
 }
@@ -969,13 +975,17 @@ void DisplayLoop() {
             }
             const u16 due = static_cast<u16>(last_taken + (waiting >= 2 ? 1 : n));
             // A NEXTFRAME set is taken at the count after the call's.
+            u32 waited = 0;
             for (u32 guard = 0; guard < 8; guard++) {
                 const u16 next = static_cast<u16>(sceDisplayGetVcount() + 1);
                 if (AtOrAfter(next, due)) {
                     break;
                 }
                 sceDisplayWaitVblankStart();
+                waited++;
             }
+            pace_waits[std::min<u32>(waited, 3)].fetch_add(1, std::memory_order_relaxed);
+            pace_waits[4 + std::min<u32>(waiting, 3) - 1].fetch_add(1, std::memory_order_relaxed);
         }
         SgxdRenderer::SgxdTrace("flip_vcount", static_cast<u16>(sceDisplayGetVcount()));
         const int shown = ShowFrame(buffer, SCE_DISPLAY_SETBUF_NEXTFRAME);

@@ -2066,10 +2066,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const auto f = VitaFrontend::SgxdPresent::TakeFlipGaps();
                     LOG_INFO(Frontend,
                              "stats: speed {}% game {}.{} fps shown {} fps; gaps handed {} {} {} "
-                             "{} reached {} {} {} {} shown {} {} {} {} flips {} {} {} {}",
+                             "{} reached {} {} {} {} shown {} {} {} {} flips {} {} {} {}; paced waits {} {} {} "
+                             "{}, queued {} {} {}",
                              speed_percent.load(std::memory_order_relaxed), g10 / 10, g10 % 10,
                              shown - last_shown, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-                             p[8], p[9], p[10], p[11], f[0], f[1], f[2], f[3]);
+                             p[8], p[9], p[10], p[11], f[0], f[1], f[2], f[3], f[4], f[5],
+                             f[6], f[7], f[8], f[9], f[10]);
                     // The CPU time each thread ran in the interval (its own run clock): which one
                     // runs out of time when the game slows down.
                     static u64 last_emu = 0, last_render = 0, last_parse = 0;
