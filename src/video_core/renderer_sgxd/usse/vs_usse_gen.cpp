@@ -391,6 +391,7 @@ private:
     std::optional<Quad> gs_zero_inputs;        ///< Geometry, uniform modes: what v<r> reads (zero)
     std::array<std::optional<Quad>, 16> gs_input_quads; ///< Geometry: VsRequest::gs_input_rows
     std::array<std::vector<Quad>, 3> gs_slots; ///< Geometry: the emit buffer's three vertices
+    Quad gs_zero{}; ///< Geometry, gs_zero_slots: zeros, stored over the invocation's room
     Quad gs_state{};                  ///< Geometry: x the triangles stored (float), y a triangle's
                                       ///< bytes / 16, z the next triangle's address (ints)
     /// Geometry, gs_serial: the invocation's table entry (loaded words), the loop's state (x
@@ -902,6 +903,9 @@ void VertexEmitter::Layout() {
             }
         }
         gs_state = AllocateQuad();
+        if (req.gs_zero_slots) {
+            gs_zero = AllocateQuad();
+        }
         if (dynamic_emit) {
             gs_emit = AllocateQuad();
         }
@@ -2055,6 +2059,19 @@ void VertexEmitter::Prologue() {
         e.Bitwise(BwOp::Or, size, IOp::Imm(static_cast<uint8_t>(3 * req.num_outputs)),
                   IOp::Imm(0));
         e.Bitwise(BwOp::Or, next, IOp::R(GsWord(0)), IOp::Imm(0));
+        if (req.gs_zero_slots) {
+            // The invocation's room zeroed, a triangle at a time as GsStoreTriangle stores one,
+            // then the first triangle's place again.
+            e.MoveInternal({gs_zero.Pair(0), 0x3}, {Reg::C(0), XYZW});
+            e.MoveInternal({gs_zero.Pair(1), 0x3}, {Reg::C(0), XYZW});
+            for (uint32_t t = 0; t < req.gs_max_triangles; t++) {
+                for (uint32_t q = 0; q < 3 * req.num_outputs; q++) {
+                    StoreQuad(next, q * 4, gs_zero);
+                }
+                e.MadI32(next, size, 16, next);
+            }
+            e.Bitwise(BwOp::Or, next, IOp::R(GsWord(0)), IOp::Imm(0));
+        }
         if (dynamic_emit) {
             // Every EMIT that reads it comes after a SETEMIT (setemit_done): written for the
             // register allocator, never read as zero.

@@ -116,6 +116,10 @@ struct VsRequest {
     /// program's opening CMP and JMPC say so), and stops before the next head. Zero: none to run.
     /// Only the instance that runs the draw's last invocation stores the state block.
     bool gs_trails = false;
+    /// Geometry: each invocation first zeroes its gs_max_triangles triangles' room, so the ones
+    /// it leaves unset are degenerate (a padded draw's pass B draws every slot), rather than the
+    /// CPU zeroing them all in uncached memory.
+    bool gs_zero_slots = false;
     /// Per-vertex effect lighting's lights (VsPvEffect), Draw mode only.
     VsPvEffect pv{};
 };

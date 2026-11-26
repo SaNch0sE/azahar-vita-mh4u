@@ -726,6 +726,9 @@ private:
         u16 used;
         bool uniform_table; ///< Usse::VsRequest::gs_uniform_table
     };
+    /// GeometryStage's choice for the draw's A1 programs, read by GeometryKeyFor and
+    /// GeometryRequest: its invocations zero their slots (Usse::VsRequest::gs_zero_slots).
+    bool gs_zero_slots{};
     /// `forced_parallel` sets a key bit of its own, only when true: the other keys are unchanged.
     GeometryKey GeometryKeyFor(u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
                                u16 input_rows, u32 max_triangles, bool serial,

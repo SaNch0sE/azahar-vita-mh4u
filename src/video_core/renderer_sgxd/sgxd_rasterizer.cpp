@@ -4894,7 +4894,8 @@ RasterizerSgxd::GeometryKey RasterizerSgxd::GeometryKeyFor(u32 rows, bool rows_u
         static_cast<u64>(bools) << 48 | static_cast<u64>(used) << 32 |
             static_cast<u64>(max_triangles) << 16 | (rows_table ? 0x8000u : 0u) |
             first_uniform << 8 | (rows_uniform ? 0x80u : 0u) | rows,
-        (forced_parallel ? 1ull << 18 : 0ull) | (uniform_table ? 1ull << 17 : 0ull) |
+        (gs_zero_slots ? 1ull << 19 : 0ull) | (forced_parallel ? 1ull << 18 : 0ull) |
+            (uniform_table ? 1ull << 17 : 0ull) |
             static_cast<u64>(input_rows) << 1 | (serial ? 1u : 0u));
     return {key, bools, used, uniform_table};
 }
@@ -4929,6 +4930,7 @@ Usse::VsRequest RasterizerSgxd::GeometryRequest(const GeometryKey& k, u32 rows, 
     request.gs_serial = serial;
     // Both: the draw's trails, side by side (the Parallel geometry option, a trail program).
     request.gs_trails = serial && forced_parallel;
+    request.gs_zero_slots = gs_zero_slots;
     return request;
 }
 
@@ -5469,6 +5471,10 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     // b15 turns true after every invocation and stays so until the game writes it again: a program
     // that reads it while it is false runs the first invocation with it false and the rest true.
     const bool b15 = pica.gs_setup.uniforms.b[15];
+    // A padded draw's slots zeroed by its A1 invocations (Usse::VsRequest::gs_zero_slots), where
+    // the room is small enough to store over: no CPU writes of the zeros in uncached memory
+    // (~1 us an invocation of the render thread's, the most of a draw's per-invocation cost).
+    gs_zero_slots = padded && cap * tri_bytes <= 96 * 16;
     const VertexProgram* first_program = nullptr;
     const VertexProgram* program = nullptr;
     u16 input_rows = 0;
@@ -5570,7 +5576,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                "memory of its own (past a pass's data): not built",
                describe(), stale & gs_rows_own);
     const SgxdBackend::Data gs_out = stored_data(invocations * cap * tri_bytes);
-    if (padded) {
+    if (padded && !gs_zero_slots) {
         std::memset(gs_out.cpu, 0, invocations * cap * tri_bytes);
     }
     const SgxdBackend::Data gs_ends = backend.AllocData(invocations * 4);
