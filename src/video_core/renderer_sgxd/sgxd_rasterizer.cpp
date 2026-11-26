@@ -5091,6 +5091,23 @@ std::array<std::atomic<u64>, 3> tools_geometry_us{};
 /// program and its data, 5 the programs' PDS and the draw's submission (to Draw's end, any
 /// return); 6 the draws.
 std::array<std::atomic<u64>, 7> tools_draw_us{};
+/// Tools builds' cpu line: GeometryStage's time by part (us): 0 its setup, 1 pass A0, 2 pass
+/// A1's programs and tables, 3 pass A1's runs (SA images, programs, stream-out), 4 pass B.
+std::array<std::atomic<u64>, 5> tools_geometry_parts{};
+struct ToolsPartMarks {
+    std::array<std::atomic<u64>, 5>& sums;
+    u64 last = sceKernelGetProcessTimeWide();
+    int next = 0;
+    void Mark(int part) {
+        const u64 now = sceKernelGetProcessTimeWide();
+        sums[part].fetch_add(now - last, std::memory_order_relaxed);
+        last = now;
+        next = part + 1;
+    }
+    ~ToolsPartMarks() {
+        sums[next].fetch_add(sceKernelGetProcessTimeWide() - last, std::memory_order_relaxed);
+    }
+};
 struct ToolsUsTimer {
     std::atomic<u64>& sum;
     u64 start = sceKernelGetProcessTimeWide();
@@ -5110,6 +5127,10 @@ u32 RasterizerSgxd::ToolsGeometryOrder(int which) {
 
 u64 RasterizerSgxd::ToolsGeometryUs(int which) {
     return tools_geometry_us[which].load(std::memory_order_relaxed);
+}
+
+u64 RasterizerSgxd::ToolsGeometryPartUs(int which) {
+    return tools_geometry_parts[which].load(std::memory_order_relaxed);
 }
 
 u64 RasterizerSgxd::ToolsDrawUs(int which) {
@@ -5149,6 +5170,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                                                         const Describe& describe) {
 #if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
     const ToolsUsTimer tools_timer{tools_geometry_us[0]};
+    ToolsPartMarks tools_parts{tools_geometry_parts};
 #endif
     using GSMode = Pica::PipelineRegs::GSMode;
     const auto& pipeline = regs.pipeline;
@@ -5333,6 +5355,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     }
 #endif
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_parts.Mark(0);
+#endif
     // --- pass A0: the vertex program, each vertex's outputs stored densely ---
     VertexStage a0 = VertexStageFor(is_indexed, nullptr, count, Usse::VsMode::StoreOutputs,
                                     describe);
@@ -5437,6 +5462,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         backend.StreamOut(p, a0_count, SgxdBackend::StreamStage::A0, wait);
     }
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_parts.Mark(1);
+#endif
     // --- pass A1: the geometry program, one invocation a vertex ---
     // b15 turns true after every invocation and stays so until the game writes it again: a program
     // that reads it while it is false runs the first invocation with it false and the rest true.
@@ -5758,6 +5786,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         stream_note.stage = nullptr;
 #endif
     };
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_parts.Mark(2);
+#endif
     if (first_program == program) {
         run_invocations(*program, 0, invocations);
     } else {
@@ -5767,6 +5798,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         }
     }
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_parts.Mark(3);
+#endif
     // --- pass B: the stored triangles, as the draw's vertices ---
     std::vector<u16>& list = gs_list;
     list.clear();

@@ -2150,6 +2150,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          (geo_us[1] - last_geo_us[1]) / 1000,
                                          (geo_us[2] - last_geo_us[2]) / 1000);
                     last_geo_us = geo_us;
+                    static std::array<u64, 5> last_parts{};
+                    std::array<u64, 5> parts{};
+                    for (int k = 0; k < 5; k++) {
+                        parts[k] = SgxdRenderer::RasterizerSgxd::ToolsGeometryPartUs(k);
+                    }
+                    sites += fmt::format(" (setup {} A0 {} A1 setup {} A1 runs {} B {} ms)",
+                                         (parts[0] - last_parts[0]) / 1000,
+                                         (parts[1] - last_parts[1]) / 1000,
+                                         (parts[2] - last_parts[2]) / 1000,
+                                         (parts[3] - last_parts[3]) / 1000,
+                                         (parts[4] - last_parts[4]) / 1000);
+                    last_parts = parts;
                     static std::array<u64, 7> last_draw_us{};
                     std::array<u64, 7> draw_us{};
                     for (int k = 0; k < 7; k++) {
