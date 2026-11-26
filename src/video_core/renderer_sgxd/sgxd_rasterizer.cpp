@@ -5083,6 +5083,16 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
 namespace {
 std::array<std::atomic<u32>, 3> tools_geometry{};
 std::array<std::atomic<u32>, 6> tools_geometry_order{};
+/// Tools builds' cpu line: the render thread's time in GeometryStage, [0] all of it, [1] its
+/// programs' lookups and makes (us).
+std::array<std::atomic<u64>, 2> tools_geometry_us{};
+struct ToolsUsTimer {
+    std::atomic<u64>& sum;
+    u64 start = sceKernelGetProcessTimeWide();
+    ~ToolsUsTimer() {
+        sum.fetch_add(sceKernelGetProcessTimeWide() - start, std::memory_order_relaxed);
+    }
+};
 } // Anonymous namespace
 
 u32 RasterizerSgxd::ToolsGeometryDraws(int which) {
@@ -5091,6 +5101,10 @@ u32 RasterizerSgxd::ToolsGeometryDraws(int which) {
 
 u32 RasterizerSgxd::ToolsGeometryOrder(int which) {
     return tools_geometry_order[which].load(std::memory_order_relaxed);
+}
+
+u64 RasterizerSgxd::ToolsGeometryUs(int which) {
+    return tools_geometry_us[which].load(std::memory_order_relaxed);
 }
 #endif
 
@@ -5110,6 +5124,9 @@ RasterizerSgxd::GsCodeFacts RasterizerSgxd::GsFacts() {
 
 RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                                                         const Describe& describe) {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    const ToolsUsTimer tools_timer{tools_geometry_us[0]};
+#endif
     using GSMode = Pica::PipelineRegs::GSMode;
     const auto& pipeline = regs.pipeline;
     const u32 count = pipeline.num_vertices;
@@ -5415,6 +5432,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     bool serial = false;
     bool forced_parallel = false;
     const auto programs = [&] {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        const ToolsUsTimer tools_programs_timer{tools_geometry_us[1]};
+#endif
         // A new draw's two programs at once: the second on the first tier's worker.
         QueueGeometryPair(rows, rows_uniform, rows_table, first_uniform, input_rows, cap, serial,
                           forced_parallel, b15);

@@ -121,6 +121,9 @@ public:
     /// (odd) by how pass A1 ran them: 0-1 in parallel, 2-3 in order (VsRequest::gs_serial), 4-5 in
     /// parallel although the program reads a temporary first (the Parallel geometry option).
     [[nodiscard]] static u32 ToolsGeometryOrder(int which);
+    /// Tools builds' cpu line, since the start: the render thread's us in GeometryStage (0) and in
+    /// its programs' lookups and makes (1).
+    [[nodiscard]] static u64 ToolsGeometryUs(int which);
     /// Tools builds' slow-frame recorder (RenderThread): from Start to End (a present to the
     /// next), every pass rendered on its own and timed (SgxdBackend::tools_timing) and each
     /// draw's fragment program counted with its pass; End logs the passes by GPU time and the

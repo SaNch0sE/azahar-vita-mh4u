@@ -2140,6 +2140,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          order[2] - last_order[2], order[3] - last_order[3],
                                          order[4] - last_order[4], order[5] - last_order[5]);
                     last_order = order;
+                    static std::array<u64, 2> last_geo_us{};
+                    const std::array<u64, 2> geo_us{SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(0),
+                                                    SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(1)};
+                    sites += fmt::format("; geometry stage {} ms (programs {} ms)",
+                                         (geo_us[0] - last_geo_us[0]) / 1000,
+                                         (geo_us[1] - last_geo_us[1]) / 1000);
+                    last_geo_us = geo_us;
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
                              sgxd_wait_us_take() / 1000, renders - last_renders, sites);
