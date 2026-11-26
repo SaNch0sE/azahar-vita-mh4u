@@ -5085,7 +5085,12 @@ std::array<std::atomic<u32>, 3> tools_geometry{};
 std::array<std::atomic<u32>, 6> tools_geometry_order{};
 /// Tools builds' cpu line: the render thread's time in GeometryStage, [0] all of it, [1] its
 /// programs' lookups and makes (us).
-std::array<std::atomic<u64>, 2> tools_geometry_us{};
+std::array<std::atomic<u64>, 3> tools_geometry_us{};
+/// Tools builds' cpu line: Draw's time by stage (us): 0 the uniforms, 1 the textures
+/// (TextureReads), 2 the pass and its target, 3 the vertex stage and its SA image, 4 the fragment
+/// program and its data, 5 the programs' PDS and the draw's submission (to Draw's end, any
+/// return); 6 the draws.
+std::array<std::atomic<u64>, 7> tools_draw_us{};
 struct ToolsUsTimer {
     std::atomic<u64>& sum;
     u64 start = sceKernelGetProcessTimeWide();
@@ -5105,6 +5110,24 @@ u32 RasterizerSgxd::ToolsGeometryOrder(int which) {
 
 u64 RasterizerSgxd::ToolsGeometryUs(int which) {
     return tools_geometry_us[which].load(std::memory_order_relaxed);
+}
+
+u64 RasterizerSgxd::ToolsDrawUs(int which) {
+    return tools_draw_us[which].load(std::memory_order_relaxed);
+}
+
+RasterizerSgxd::ToolsDrawSections::ToolsDrawSections() : last(sceKernelGetProcessTimeWide()) {}
+
+void RasterizerSgxd::ToolsDrawSections::Mark(int stage) {
+    const u64 now = sceKernelGetProcessTimeWide();
+    tools_draw_us[stage].fetch_add(now - last, std::memory_order_relaxed);
+    last = now;
+    next = stage + 1;
+}
+
+RasterizerSgxd::ToolsDrawSections::~ToolsDrawSections() {
+    tools_draw_us[next].fetch_add(sceKernelGetProcessTimeWide() - last, std::memory_order_relaxed);
+    tools_draw_us[6].fetch_add(1, std::memory_order_relaxed);
 }
 #endif
 
@@ -7368,6 +7391,9 @@ float RasterizerSgxd::ClipZSign(const VertexProgram& vp, const Pica::ShaderSetup
 SgxdBackend::Data RasterizerSgxd::VertexSa(const VertexProgram& vp,
                                           const Pica::ShaderSetup& setup, u32& vsec_sa,
                                           const Describe& describe) {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    const ToolsUsTimer tools_timer{tools_geometry_us[2]};
+#endif
     const Usse::Program& vg = vp.usse;
     // The image is put together in cached memory and copied once (the pass data is uncached CDRAM).
     // The program's scratch holds the fixed part; each draw writes its values over the same words.
@@ -8263,6 +8289,10 @@ bool RasterizerSgxd::FillsClearQuad(bool is_indexed, const float* immediate, u32
 
 bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate_count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    ToolsDrawSections tools_sections;
+#endif
+
 #ifdef VITA_DIAGNOSTICS
     clip_plane_all++;
     if (regs.rasterizer.clip_enable) {
@@ -8327,6 +8357,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     fragment_regs_dirty |= StateRegs::AnyDirty(StateRegs::FragmentMask, pica.dirty_regs.qwords);
     layout_regs_dirty |= StateRegs::AnyDirty(StateRegs::LayoutMask, pica.dirty_regs.qwords);
     SyncDrawUniforms();
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_sections.Mark(0);
+#endif
 
     // --- the target and the output merger ---
     const auto& fb = regs.framebuffer.framebuffer;
@@ -8531,6 +8564,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // ended, so it ends here. Bytes no
     // draw covered are guest memory's still.
     TextureReads(is_indexed, immediate, count);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_sections.Mark(1);
+#endif
     // A texture over a depth buffer reads the depth a pass left there; only a unit the program samples.
     u32 depth_units = 0;
     for (u32 unit = 0; unit < 3; unit++) {
@@ -9207,6 +9243,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
     // geometry shader, the triangles its passes stored ---
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_sections.Mark(2);
+#endif
     draw_view = DrawViewport();
     // Per-vertex effect lighting: a blended draw whose lighting allows it asks its vertex program
     // to light it; the fragment program follows what that program does.
@@ -9226,6 +9265,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // --- the vertex program's SA block and uniform buffer ---
     u32 vsec_sa = 0;
     const SgxdBackend::Data vsa = VertexSa(vp, *stage.setup, vsec_sa, describe);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_sections.Mark(3);
+#endif
     const float* const vsa_f = reinterpret_cast<const float*>(vsa.cpu);
     const u32 vsa_words = vsec_sa;
 
@@ -9549,6 +9591,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 
     // --- the PDS programs ---
     SgxdRecipeDrawPrograms p{};
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_sections.Mark(4);
+#endif
     VertexPrograms(stage, vsa, vsec_sa, p, describe);
     const auto fsec = backend.SecondaryPds(fsa.gpu, fsa_words, fp.secondary_doutu0);
     DEBUG_ASSERT(fsec.va != 0);

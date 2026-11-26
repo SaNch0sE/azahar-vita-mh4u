@@ -2140,13 +2140,31 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          order[2] - last_order[2], order[3] - last_order[3],
                                          order[4] - last_order[4], order[5] - last_order[5]);
                     last_order = order;
-                    static std::array<u64, 2> last_geo_us{};
-                    const std::array<u64, 2> geo_us{SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(0),
-                                                    SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(1)};
-                    sites += fmt::format("; geometry stage {} ms (programs {} ms)",
+                    static std::array<u64, 3> last_geo_us{};
+                    const std::array<u64, 3> geo_us{SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(0),
+                                                    SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(1),
+                                                    SgxdRenderer::RasterizerSgxd::ToolsGeometryUs(2)};
+                    sites += fmt::format("; geometry stage {} ms (programs {} ms); vertex SA "
+                                         "images {} ms",
                                          (geo_us[0] - last_geo_us[0]) / 1000,
-                                         (geo_us[1] - last_geo_us[1]) / 1000);
+                                         (geo_us[1] - last_geo_us[1]) / 1000,
+                                         (geo_us[2] - last_geo_us[2]) / 1000);
                     last_geo_us = geo_us;
+                    static std::array<u64, 7> last_draw_us{};
+                    std::array<u64, 7> draw_us{};
+                    for (int k = 0; k < 7; k++) {
+                        draw_us[k] = SgxdRenderer::RasterizerSgxd::ToolsDrawUs(k);
+                    }
+                    sites += fmt::format("; draw stages ms: uniforms {} textures {} pass {} vertex "
+                                         "{} fragment {} submit {} ({} draws)",
+                                         (draw_us[0] - last_draw_us[0]) / 1000,
+                                         (draw_us[1] - last_draw_us[1]) / 1000,
+                                         (draw_us[2] - last_draw_us[2]) / 1000,
+                                         (draw_us[3] - last_draw_us[3]) / 1000,
+                                         (draw_us[4] - last_draw_us[4]) / 1000,
+                                         (draw_us[5] - last_draw_us[5]) / 1000,
+                                         draw_us[6] - last_draw_us[6]);
+                    last_draw_us = draw_us;
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
                              sgxd_wait_us_take() / 1000, renders - last_renders, sites);

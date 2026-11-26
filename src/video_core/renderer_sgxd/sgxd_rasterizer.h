@@ -124,6 +124,15 @@ public:
     /// Tools builds' cpu line, since the start: the render thread's us in GeometryStage (0) and in
     /// its programs' lookups and makes (1).
     [[nodiscard]] static u64 ToolsGeometryUs(int which);
+    /// Tools builds' cpu line, since the start: Draw's us by stage (0-5) and its count (6).
+    [[nodiscard]] static u64 ToolsDrawUs(int which);
+    struct ToolsDrawSections {
+        ToolsDrawSections();
+        ~ToolsDrawSections();
+        void Mark(int stage);
+        u64 last;
+        int next = 0;
+    };
     /// Tools builds' slow-frame recorder (RenderThread): from Start to End (a present to the
     /// next), every pass rendered on its own and timed (SgxdBackend::tools_timing) and each
     /// draw's fragment program counted with its pass; End logs the passes by GPU time and the
