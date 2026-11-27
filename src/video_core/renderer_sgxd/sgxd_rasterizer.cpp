@@ -7178,92 +7178,22 @@ void WidenIndices(u16* out, const u8* in, u32 count) {
 }
 } // Anonymous namespace
 
-RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
-                                                         u32 count, Usse::VsMode mode,
-                                                         const Describe& describe, u32 pv) {
-    const auto& pipeline = regs.pipeline;
-    const auto& va = pipeline.vertex_attributes;
-    const PAddr base = va.GetPhysicalBaseAddress();
-    struct Feed {
-        u32 reg;
-        PAddr address;
-        u32 stride;
-        u32 words;
-        u32 loader;
-    };
-    std::array<Feed, 16> feeds{};
-    u32 feed_count = 0;
-    u16 enabled_regs = 0;
-    std::array<u8, 16> reg_components{};
-    u16 u8_regs = 0, s8_regs = 0, s16_regs = 0;
-    // An immediate batch sits in the pass data, each vertex its attributes' four floats.
-    SgxdBackend::Data immediate_data{};
-    if (immediate) {
-        const u32 stride = immediate_attributes * 16;
-        immediate_data = backend.AllocData(count * stride);
-        std::memcpy(immediate_data.cpu, immediate, count * stride);
-        for (u32 attr = 0; attr < immediate_attributes; attr++) {
-            const u32 reg = regs.vs.GetRegisterForAttribute(attr);
-            feeds[feed_count++] = {reg, immediate_data.gpu + attr * 16, stride, 4, 0};
-            enabled_regs |= static_cast<u16>(1u << reg);
-            reg_components[reg] = 4;
-        }
-    }
-    // The format decoded once (VertexLayoutFor); the addresses added mesh by mesh.
-    VertexLayout* layout = nullptr;
-    if (!immediate) {
-        layout = &VertexLayoutFor();
-        for (u32 n = 0; n < layout->count; n++) {
-            const VertexLayout::Attribute& a = layout->attributes[n];
-            feeds[feed_count++] = {a.reg, base + va.attribute_loaders[a.loader].data_offset + a.offset,
-                                   a.stride, a.words, a.loader};
-        }
-        enabled_regs = layout->enabled_regs;
-        u8_regs = layout->u8_regs;
-        s8_regs = layout->s8_regs;
-        s16_regs = layout->s16_regs;
-        reg_components = layout->reg_components;
-    }
-    // Every register no loader feeds is a uniform: the fixed default attribute where the guest set
-    // one, (0, 0, 0, 1) otherwise.
-    const u16 default_regs = static_cast<u16>(~enabled_regs);
-    // The program the layout resolved to last, while its other inputs are the same.
-    const VertexProgram* program = nullptr;
-    std::array<u32, VertexLayout::ProgramKeyWords> program_key{};
-    if (layout) {
-        program_key = VertexProgramKey(regs, pica.vs_setup, mode);
-        // Per-vertex effect lighting's variant is another program for the same layout.
-        program_key[15] |= pv << 8;
-        if (layout->program && layout->program->tier2_queued && layout->program_key == program_key) {
-            program = layout->program;
-        }
-    }
-    if (!program) {
-        program = &VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode,
-                                    pv);
-        if (layout) {
-            layout->program_key = program_key;
-            layout->program = program;
-        }
-    }
-    const VertexProgram& vp = *program;
-    const Usse::Program& vg = vp.usse;
-
-    // --- the index list ---
+RasterizerSgxd::IndexedReads RasterizerSgxd::ReadIndexedList(
+    std::span<const VertexFeed> feeds, u16 input_regs, PAddr index_address, bool index_u16,
+    u32 count, Usse::VsMode mode, const Describe& describe) {
     // The VDM reads 16-bit indices where the guest put them; it has no 8-bit format, so 8-bit indices
     // are widened by the render thread into the pass data. The vertex range is what the cache clean
     // needs.
-    u32 indices_gpu = 0;
-    u32 vertex_min = immediate ? 0 : pipeline.vertex_offset;
-    u32 vertex_max = vertex_min + count - 1;
+    const auto& pipeline = regs.pipeline;
+    IndexedReads r{true, true, 0, pipeline.vertex_offset, pipeline.vertex_offset + count - 1};
+    u32& indices_gpu = r.indices_gpu;
+    u32& vertex_min = r.vertex_min;
+    u32& vertex_max = r.vertex_max;
     // A draw's vertex range only decides which of its bytes in cached FCRAM to clean (and record for
     // the VBlank's move to CDRAM). Where every vertex an index can reach is uncached already (VRAM, or
     // 8-bit indices into moved FCRAM pages), no index is read: uncached reads are slow.
-    bool scan = true;
-    if (is_indexed) {
-        const auto& index_info = pipeline.index_array;
-        const PAddr index_address = va.GetPhysicalBaseAddress() + index_info.offset;
-        const bool index_u16 = index_info.format != 0;
+    bool& scan = r.scan;
+    {
         const u32 index_bytes = count * (index_u16 ? 2 : 1);
         // A geometry draw's copy stands for guest memory.
         const bool indices_mapped = gs_indices_set ||
@@ -7286,7 +7216,8 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
                             "the draw draws nothing (logged once)",
                             describe(), index_address, index_bytes);
             }
-            return VertexStage{};
+            r.mapped = false;
+            return r;
         }
         const u8* const index_cpu = memory.GetPhysicalPointer(index_address);
         // What the CPU reads of them: a geometry draw's copy, an 8-bit list as the render thread read it
@@ -7299,9 +7230,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         const u32 reach = index_u16 ? 0xffffu : 0xffu; // the highest index there can be
         if (mode == Usse::VsMode::Draw && indices_uncached) {
             scan = false;
-            for (u32 n = 0; n < feed_count && !scan; n++) {
-                const Feed& f = feeds[n];
-                if ((vp.input_regs & (1u << f.reg)) == 0) {
+            for (std::size_t n = 0; n < feeds.size() && !scan; n++) {
+                const VertexFeed& f = feeds[n];
+                if ((input_regs & (1u << f.reg)) == 0) {
                     continue;
                 }
                 const bool vram =
@@ -7361,6 +7292,118 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
             }
         }
     }
+    return r;
+}
+
+void RasterizerSgxd::CleanVertexReads(std::span<const VertexFeed> feeds, u16 input_regs,
+                                      u32 first, const IndexedReads& r) {
+    // Unscanned, every vertex the indices can reach is uncached.
+    if (!r.scan) {
+        return;
+    }
+    for (const VertexFeed& f : feeds) {
+        if ((input_regs & (1u << f.reg)) == 0) {
+            continue;
+        }
+        // FCRAM is cached for the CPU: what the guest wrote is cleaned to memory before the kick.
+        const PAddr read = f.address + first * f.stride + (r.vertex_min - first) * f.stride;
+        const u32 bytes = (r.vertex_max - r.vertex_min) * f.stride + f.words * 4;
+        // Not seen yet: the TA would stop on the GPU's page fault.
+        ASSERT_MSG(
+            (read >= Memory::FCRAM_PADDR && read + bytes <= Memory::FCRAM_PADDR_END) ||
+                (read >= Memory::VRAM_PADDR && read + bytes <= Memory::VRAM_PADDR_END),
+            "sgxd: vertices at {:#x}+{:#x} are outside the mapped guest memory", read, bytes);
+        if (guest_memory.IsUncached(read, bytes) || (cleaned_geometry & (1u << f.loader)) != 0) {
+            SgxdCacheSkipped(CacheSite::Vertices, bytes);
+        } else {
+            backend.ReadsCached(memory.GetPhysicalPointer(read), bytes);
+            CachedRead(read, bytes);
+        }
+    }
+}
+
+RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
+                                                         u32 count, Usse::VsMode mode,
+                                                         const Describe& describe, u32 pv) {
+    const auto& pipeline = regs.pipeline;
+    const auto& va = pipeline.vertex_attributes;
+    const PAddr base = va.GetPhysicalBaseAddress();
+    std::array<VertexFeed, 16> feeds{};
+    u32 feed_count = 0;
+    u16 enabled_regs = 0;
+    std::array<u8, 16> reg_components{};
+    u16 u8_regs = 0, s8_regs = 0, s16_regs = 0;
+    // An immediate batch sits in the pass data, each vertex its attributes' four floats.
+    SgxdBackend::Data immediate_data{};
+    if (immediate) {
+        const u32 stride = immediate_attributes * 16;
+        immediate_data = backend.AllocData(count * stride);
+        std::memcpy(immediate_data.cpu, immediate, count * stride);
+        for (u32 attr = 0; attr < immediate_attributes; attr++) {
+            const u32 reg = regs.vs.GetRegisterForAttribute(attr);
+            feeds[feed_count++] = {reg, immediate_data.gpu + attr * 16, stride, 4, 0};
+            enabled_regs |= static_cast<u16>(1u << reg);
+            reg_components[reg] = 4;
+        }
+    }
+    // The format decoded once (VertexLayoutFor); the addresses added mesh by mesh.
+    VertexLayout* layout = nullptr;
+    if (!immediate) {
+        layout = &VertexLayoutFor();
+        for (u32 n = 0; n < layout->count; n++) {
+            const VertexLayout::Attribute& a = layout->attributes[n];
+            feeds[feed_count++] = {a.reg, base + va.attribute_loaders[a.loader].data_offset + a.offset,
+                                   a.stride, a.words, a.loader};
+        }
+        enabled_regs = layout->enabled_regs;
+        u8_regs = layout->u8_regs;
+        s8_regs = layout->s8_regs;
+        s16_regs = layout->s16_regs;
+        reg_components = layout->reg_components;
+    }
+    // Every register no loader feeds is a uniform: the fixed default attribute where the guest set
+    // one, (0, 0, 0, 1) otherwise.
+    const u16 default_regs = static_cast<u16>(~enabled_regs);
+    // The program the layout resolved to last, while its other inputs are the same.
+    const VertexProgram* program = nullptr;
+    std::array<u32, VertexLayout::ProgramKeyWords> program_key{};
+    if (layout) {
+        program_key = VertexProgramKey(regs, pica.vs_setup, mode);
+        // Per-vertex effect lighting's variant is another program for the same layout.
+        program_key[15] |= pv << 8;
+        if (layout->program && layout->program->tier2_queued && layout->program_key == program_key) {
+            program = layout->program;
+        }
+    }
+    if (!program) {
+        program = &VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode,
+                                    pv);
+        if (layout) {
+            layout->program_key = program_key;
+            layout->program = program;
+        }
+    }
+    const VertexProgram& vp = *program;
+    const Usse::Program& vg = vp.usse;
+
+    // --- the index list ---
+    u32 indices_gpu = 0;
+    u32 vertex_min = immediate ? 0 : pipeline.vertex_offset;
+    u32 vertex_max = vertex_min + count - 1;
+    IndexedReads reads{true, true, 0, vertex_min, vertex_max};
+    if (is_indexed) {
+        const auto& index_info = pipeline.index_array;
+        reads = ReadIndexedList(std::span<const VertexFeed>{feeds.data(), feed_count},
+                                vp.input_regs, va.GetPhysicalBaseAddress() + index_info.offset,
+                                index_info.format != 0, count, mode, describe);
+        if (!reads.mapped) {
+            return VertexStage{};
+        }
+        indices_gpu = reads.indices_gpu;
+        vertex_min = reads.vertex_min;
+        vertex_max = reads.vertex_max;
+    }
+    const bool scan = reads.scan;
 
     VertexStage stage;
     std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH>& fetch = stage.fetch;
@@ -7369,7 +7412,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
                      : is_indexed                ? 0
                                                  : pipeline.vertex_offset;
     for (u32 n = 0; n < feed_count; n++) {
-        const Feed& f = feeds[n];
+        const VertexFeed& f = feeds[n];
         if ((vp.input_regs & (1u << f.reg)) == 0) {
             continue;
         }
@@ -7382,25 +7425,10 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         // from the loader's address.
         const PAddr address = immediate ? f.address : f.address + first * f.stride;
         fetch[fetch_count++] = {address, f.stride, f.words, resource};
-        // Unscanned, every vertex the indices can reach is uncached (above).
-        if (immediate || !scan) {
-            continue;
-        }
-        // FCRAM is cached for the CPU: what the guest wrote is cleaned to memory before the kick.
-        const PAddr read = address + (vertex_min - first) * f.stride;
-        const u32 bytes = (vertex_max - vertex_min) * f.stride + f.words * 4;
-        // Not seen yet: the TA would stop on the GPU's page fault.
-        ASSERT_MSG(
-            (read >= Memory::FCRAM_PADDR && read + bytes <= Memory::FCRAM_PADDR_END) ||
-                (read >= Memory::VRAM_PADDR && read + bytes <= Memory::VRAM_PADDR_END),
-            "sgxd: {}: vertices at {:#x}+{:#x} are outside the mapped guest memory", describe(),
-            read, bytes);
-        if (guest_memory.IsUncached(read, bytes) || (cleaned_geometry & (1u << f.loader)) != 0) {
-            SgxdCacheSkipped(CacheSite::Vertices, bytes);
-        } else {
-            backend.ReadsCached(memory.GetPhysicalPointer(read), bytes);
-            CachedRead(read, bytes);
-        }
+    }
+    if (!immediate) {
+        CleanVertexReads(std::span<const VertexFeed>{feeds.data(), feed_count}, vp.input_regs,
+                         first, reads);
     }
 
 

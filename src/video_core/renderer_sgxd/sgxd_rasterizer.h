@@ -583,6 +583,28 @@ private:
         const Pica::ShaderSetup* setup{}; // the unit whose uniforms the program reads
         bool fresh{}; // a fetch reads pass data allocated for the draw (SgxdBackend::VertexPds)
     };
+    struct VertexFeed {
+        u32 reg;
+        PAddr address;
+        u32 stride;
+        u32 words;
+        u32 loader;
+    };
+    struct IndexedReads {
+        bool mapped; // false: the indices are outside the guest's memory, the draw draws nothing
+        bool scan;   // the vertex range comes from the index list (else every reachable vertex)
+        u32 indices_gpu;
+        u32 vertex_min;
+        u32 vertex_max;
+    };
+    /// An indexed draw's index list: whether it is mapped, whether to scan it, the vertex range, and
+    /// the list's GPU address (cleaned or widened as needed).
+    IndexedReads ReadIndexedList(std::span<const VertexFeed> feeds, u16 input_regs,
+                                 PAddr index_address, bool index_u16, u32 count, Usse::VsMode mode,
+                                 const Describe& describe);
+    /// Cleans the cached guest vertices a draw's feeds read, over the range `r` found.
+    void CleanVertexReads(std::span<const VertexFeed> feeds, u16 input_regs, u32 first,
+                          const IndexedReads& r);
     /// The loaders' attributes into the PICA's vertex program. With StoreOutputs the fetch covers
     /// vertex_min to vertex_max densely and the caller adds the stores and the index list.
     /// `pv`: per-vertex effect lighting's lights (PvEffectRequest), 0 for none.
