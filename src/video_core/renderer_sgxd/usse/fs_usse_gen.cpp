@@ -5643,6 +5643,15 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     // compiler's do.
     e.Phas(!uses_kill);
     e.Nop();
+#ifdef VITA_DIAGNOSTICS
+    std::size_t section_from = 0;
+    const auto section = [&](std::string_view name) {
+        program.sections += fmt::format(" {} {}", name, e.Count() - section_from);
+        section_from = e.Count();
+    };
+#else
+    const auto section = [](std::string_view) {};
+#endif
     Scissor();
     PlanCombinerBuffer();
     early_alpha = PlanEarlyAlpha();
@@ -5664,6 +5673,7 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     } else {
         SampleTextures();
     }
+    section("textures");
     // An own-pixel unit's texel is the tile's colour, as F32 (the U8 combiners copy it in
     // U8Inputs).
     if (!u8_tev) {
@@ -5687,25 +5697,31 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     if (!unit_used[0] && config.texture.texture0_type == TextureType::Disabled) {
         CopyVec4({Bank::Virtual, TmpTex0}, {Bank::Const, 0});
     }
+    section("inputs");
     if (uses_lighting && Pv()) {
         PvLighting();
     } else if (uses_lighting) {
         Lighting();
     }
+    section("lighting");
     if (u8_tev) {
         // combiner_output starts at zero, in U8.
         U8Inputs(early_alpha ? 2 : 3);
         u8_prev = Reg::V(TmpU8Zero);
+        section("u8in");
         for (u32 i = 0; i < config.texture.tev_stages.size(); i++) {
             U8TevStage(i);
+            section(fmt::format("tev{}", i));
         }
         U8Output();
+        section("out");
     } else {
         // combiner_output starts at zero; the buffers at zero and the register value.
         e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, ConstZero, ConstZero);
         e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x3}, ConstZero, ConstZero);
         for (u32 i = 0; i < config.texture.tev_stages.size(); i++) {
             TevStage(i);
+            section(fmt::format("tev{}", i));
         }
         AlphaTest();
         if (shadow_write) {

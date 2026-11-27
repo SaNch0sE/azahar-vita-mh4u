@@ -355,11 +355,14 @@ void ShaderDiskCache::Store(u64 key, bool vertex, const Usse::Program& program, 
     const std::vector<u8> bytes = Usse::SerializeProgram(program);
     // What a later run reads back must be this program, field by field: a field the serialiser
     // leaves out comes back as its default, and the runs after draw with another program. The
-    // peak fields are dumpusse's, not kept.
+    // peak fields are dumpusse's, not kept, as the diagnostics build's sections.
     Usse::Program back;
     const bool read = Usse::DeserializeProgram(bytes.data(), bytes.size(), back);
     back.peak_at = program.peak_at;
     back.peak_regs = program.peak_regs;
+#ifdef VITA_DIAGNOSTICS
+    back.sections = program.sections;
+#endif
     ASSERT_MSG(read && back == program,
                "sgxd: shader cache record {:016x} does not read back as the program it holds",
                key);

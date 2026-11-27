@@ -9729,7 +9729,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                      "perf: drawkey config {:016x}: u8 {}, lighting {:08x} (src {} config {} bump "
                      "{} sel {} renorm {}), luts d0 {:08x} d1 {:08x} sp {:08x} fr {:08x} rr {:08x} "
                      "rg {:08x} rb {:08x}; lights{}; texture {:08x}, types {}; reflection tables "
-                     "red = green {}, red = blue {}; tev{}",
+                     "red = green {}, red = blue {}; tev{}; {} words, IR by section:{}",
                      last_fragment_key, fg.output_u8, lt.raw,
                      static_cast<u32>(lt.src_num.Value()), static_cast<u32>(lt.config.Value()),
                      static_cast<u32>(lt.bump_mode.Value()),
@@ -9741,7 +9741,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                  sizeof(pica.lighting.luts[6])) == 0,
                      std::memcmp(pica.lighting.luts[6].data(), pica.lighting.luts[4].data(),
                                  sizeof(pica.lighting.luts[6])) == 0,
-                     stages);
+                     stages, fg.primary.size(), fg.sections);
         }
     }
 #endif

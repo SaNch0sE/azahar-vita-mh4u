@@ -269,6 +269,10 @@ struct Program {
     bool output_u8 = false;
     /// Instruction index at which each phase begins (the first is 0); one entry per PHAS.
     std::vector<uint32_t> phase_starts{0};
+#ifdef VITA_DIAGNOSTICS
+    /// The emitter's sections with their IR instruction counts, before lowering (drawkey config).
+    std::string sections;
+#endif
     std::vector<uint64_t> primary;
     std::vector<uint64_t> secondary;
 

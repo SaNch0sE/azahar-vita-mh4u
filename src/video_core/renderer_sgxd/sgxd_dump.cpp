@@ -46,6 +46,16 @@ void DumpBytes(const std::string& name, const void* data, std::size_t size) {
 } // namespace
 
 void DumpProgram(const char* kind, u64 key, const Usse::Program& program) {
+#ifdef VITA_DIAGNOSTICS
+    // fsonly=N: a fragment program of those keys, as emitted (fs) and by the second tier (fs2),
+    // with its IR instructions by the emitter's section.
+    static const std::vector<u32> only = SgxdFlagValues("fsonly");
+    if (!program.vertex &&
+        std::find(only.begin(), only.end(), static_cast<u32>(key)) != only.end()) {
+        LOG_INFO(Render, "perf: {} sections {:016x}: {} words, {} temps; IR by section:{}", kind, key,
+                 program.primary.size(), program.temp_count, program.sections);
+    }
+#endif
     if (!SgxdFlag("dumpusse")) {
         return;
     }
