@@ -10,6 +10,7 @@
 #include <source_location>
 #include <deque>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -94,7 +95,7 @@ public:
     /// Tools builds' cpu line, since the start: 0 the time running records (us), 1 the draws run, 2
     /// their time (us), 3 asleep waiting for the GPU (us), 4 asleep waiting for records (us).
     [[nodiscard]] static u64 ToolsRenderCounter(int which);
-    /// Tools builds' cpu line: the draws a merge of indexed strips could join (tools_strips).
+    /// Tools builds' cpu line: the parse's indexed strip runs (tools_strips).
     [[nodiscard]] static u64 ToolsStrips(int which);
 #endif
 #endif
@@ -609,10 +610,33 @@ private:
     static constexpr u32 MaxRunVertices = 256;
     HeldRun held;
     bool held_flushing{};
+    /// Indexed triangle-strip draws the parse holds back: their state is the run's first one's but
+    /// the index list (0x227) and the vertex count (0x228), sent as one StripRun of their entries.
+    /// A strip run and a geometry run are never held together: starting one sends the other.
+    struct StripRunDraw {
+        u32 index_reg; ///< register 0x227's value
+        u32 count;     ///< register 0x228's
+        DrawIndexRange indices;
+    };
+    static constexpr u32 MaxStripRunDraws = 16;
+    struct HeldStrips {
+        u32 draws = 0;
+        std::array<StripRunDraw, MaxStripRunDraws> list{};
+        u8 is_indexed{};
+        decltype(Pica::RegsInternal::reg_array) regs{}; ///< as the run's first draw left them
+    };
+    HeldStrips held_strips;
     bool RunsDraw(bool is_indexed) const;
+    /// Nothing to send since a held run's first draw: no uniform, program or table change, and
+    /// every register dirty since as `held_regs` has it but the `allowed` ones.
+    bool OnlyRegsChanged(std::initializer_list<u32> allowed,
+                         const decltype(Pica::RegsInternal::reg_array)& held_regs) const;
     bool MergeDraw(bool is_indexed);
+    bool StartsStrip(bool is_indexed) const;
+    bool JoinStrip(bool is_indexed);
     void FlushRun();
     void DrawMerged(const u16* vertices, u32 count, u16 cleaned);
+    void DrawStripRun(const StripRunDraw* list, u32 n);
 
     /// The scan's decision on a list's draw, in the scan's order: whether it is dropped (late skip,
     /// right eye), its indices' range, and a geometry draw's indices as the guest had them at the

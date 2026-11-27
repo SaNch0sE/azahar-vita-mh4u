@@ -83,6 +83,7 @@ enum class RenderThread::Op : u16 {
     Draw,       ///< extra: indexed
     GsIndices,  ///< extra: 16-bit; a geometry draw's indices as the scan read them
     MergedDraw, ///< MergedDrawHead, then its vertices' numbers (u16): RenderThread::MergeDraw
+    StripRun,   ///< u32 n, then n StripRunDraw: indexed strips, RenderThread::JoinStrip
     ImmediateVertex,
     FlushImmediate,
     AddTriangle,
@@ -226,13 +227,10 @@ std::atomic<u32> max_screen_skips{2};
 
 #if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
 namespace {
-/// Tools builds' cpu line: the parse's draws without a geometry program as a merge of indexed
-/// strips would see them (RenderThread::ToolsStrips): 0 the draws, 1 the indexed strips, 2 those
-/// following an indexed strip with nothing changed but the index list's address and count, 3
-/// those refused only by a float uniform upload, 4 by another register, 5 by a program, table or
-/// default attribute change, 6 the joinable ones of 6 vertices or fewer, 7 the joinable ones'
-/// vertices, 8 the joinable ones with 8-bit indices, 9 the runs they make.
-std::array<std::atomic<u64>, 10> tools_strips{};
+/// Tools builds' cpu line: the parse's held indexed strips (RenderThread::ToolsStrips): 0 the runs
+/// sent as a StripRun, 1 their draws, 2 the strips held and sent alone (a plain Draw), 3 the runs
+/// sent full (MaxStripRunDraws).
+std::array<std::atomic<u64>, 4> tools_strips{};
 } // Anonymous namespace
 u64 RenderThread::ToolsStrips(int which) {
     return tools_strips[which].load(std::memory_order_relaxed);
@@ -255,67 +253,9 @@ public:
     void FlushAll() override {}
     void ClearAll(bool) override {}
     bool AccelerateDrawBatch(bool is_indexed) override {
-#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
-        {
-            using Topology = Pica::PipelineRegs::TriangleTopology;
-            static decltype(Pica::RegsInternal::reg_array) last{};
-            static bool last_strip = false, in_run = false;
-            const auto& p = t.parse_pica;
-            const auto& pl = p.regs.internal.pipeline;
-            if (pl.use_gs == Pica::PipelineRegs::UseGS::No) {
-                const bool strip = is_indexed && pl.triangle_topology == Topology::Strip;
-                tools_strips[0].fetch_add(1, std::memory_order_relaxed);
-                tools_strips[1].fetch_add(strip ? 1 : 0, std::memory_order_relaxed);
-                if (strip && last_strip) {
-                    constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
-                    constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
-                    bool regs_same = true;
-                    const auto& regs = p.regs.internal.reg_array;
-                    for (u32 w = 0; w < p.dirty_regs.qwords.size(); w++) {
-                        for (u64 q = p.dirty_regs.qwords[w]; q != 0; q &= q - 1) {
-                            const u32 r = w * 64 + static_cast<u32>(std::countr_zero(q));
-                            if (r != NumReg && r != IndexReg && regs[r] != last[r]) {
-                                regs_same = false;
-                            }
-                        }
-                    }
-                    bool other = false, uniforms = false;
-                    for (const Pica::ShaderSetup* s : {&p.vs_setup, &p.gs_setup}) {
-                        uniforms |= s->uniforms_dirty;
-                        other |= s->code_hi > s->code_lo || s->swizzle_hi > s->swizzle_lo;
-                    }
-                    other |= (p.lighting.lut_dirty & Pica::PicaCore::Lighting::LutAllDirty) != 0 ||
-                             p.fog.lut_dirty || p.proctex.table_dirty != 0 ||
-                             p.default_attributes_changed;
-                    const bool joins = regs_same && !uniforms && !other;
-                    if (joins) {
-                        tools_strips[2].fetch_add(1, std::memory_order_relaxed);
-                        tools_strips[6].fetch_add(pl.num_vertices <= 6 ? 1 : 0,
-                                                  std::memory_order_relaxed);
-                        tools_strips[7].fetch_add(pl.num_vertices, std::memory_order_relaxed);
-                        tools_strips[8].fetch_add(pl.index_array.format == 0 ? 1 : 0,
-                                                  std::memory_order_relaxed);
-                        tools_strips[9].fetch_add(in_run ? 0 : 1, std::memory_order_relaxed);
-                    } else if (regs_same && !other) {
-                        tools_strips[3].fetch_add(1, std::memory_order_relaxed);
-                    } else if (!regs_same) {
-                        tools_strips[4].fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        tools_strips[5].fetch_add(1, std::memory_order_relaxed);
-                    }
-                    in_run = joins;
-                } else {
-                    in_run = false;
-                }
-                last_strip = strip;
-                last = p.regs.internal.reg_array;
-            } else {
-                last_strip = in_run = false;
-            }
-        }
-#endif
-        // A geometry draw whose state is the held run's joins it; another draw sends the run first.
-        if (t.MergeDraw(is_indexed)) {
+        // A geometry draw whose state is the held run's joins it, an indexed strip the held strips;
+        // another draw sends the run first.
+        if (t.MergeDraw(is_indexed) || t.JoinStrip(is_indexed)) {
             return true;
         }
         t.FlushRun();
@@ -340,6 +280,17 @@ public:
                 t.held.vertices.push_back(static_cast<u16>(pipeline.vertex_offset + v));
             }
             t.held.regs = t.parse_pica.regs.internal.reg_array;
+            return true;
+        }
+        if (t.StartsStrip(is_indexed)) {
+            // Held the same way: the run's first entry, with the state as synced.
+            const auto& regs = t.parse_pica.regs.internal.reg_array;
+            t.held_strips.draws = 1;
+            t.held_strips.list[0] = {regs[PICA_REG_INDEX(pipeline.index_array)],
+                                     regs[PICA_REG_INDEX(pipeline.num_vertices)],
+                                     std::exchange(t.parse_indices, DrawIndexRange{})};
+            t.held_strips.is_indexed = 1;
+            t.held_strips.regs = regs;
             return true;
         }
         t.ParsedPut(Op::Draw, std::exchange(t.parse_indices, DrawIndexRange{}),
@@ -754,12 +705,8 @@ bool RenderThread::RunsDraw(bool is_indexed) const {
            pipeline.vertex_offset + pipeline.num_vertices <= 0x10000u;
 }
 
-bool RenderThread::MergeDraw(bool is_indexed) {
-    if (held.draws == 0 || !RunsDraw(is_indexed)) {
-        return false;
-    }
-    // Nothing else to send since the run's first draw: no uniform, program or table change, and every
-    // register as that draw had it but the first vertex.
+bool RenderThread::OnlyRegsChanged(std::initializer_list<u32> allowed,
+                                   const decltype(Pica::RegsInternal::reg_array)& held_regs) const {
     const auto& p = parse_pica;
     for (const Pica::ShaderSetup* s : {&p.vs_setup, &p.gs_setup}) {
         if (s->uniforms_dirty || s->code_hi > s->code_lo || s->swizzle_hi > s->swizzle_lo) {
@@ -770,18 +717,30 @@ bool RenderThread::MergeDraw(bool is_indexed) {
         p.proctex.table_dirty != 0 || p.default_attributes_changed) {
         return false;
     }
-    constexpr u32 OffsetReg = PICA_REG_INDEX(pipeline.vertex_offset);
     const auto& regs = p.regs.internal.reg_array;
     const auto& dirty = p.dirty_regs.qwords;
     for (u32 w = 0; w < dirty.size(); w++) {
         for (u64 q = dirty[w]; q != 0; q &= q - 1) {
             const u32 r = w * 64 + static_cast<u32>(std::countr_zero(q));
-            if (r != OffsetReg && regs[r] != held.regs[r]) {
+            if (regs[r] != held_regs[r] &&
+                std::find(allowed.begin(), allowed.end(), r) == allowed.end()) {
                 return false;
             }
         }
     }
-    const auto& pipeline = p.regs.internal.pipeline;
+    return true;
+}
+
+bool RenderThread::MergeDraw(bool is_indexed) {
+    if (held.draws == 0 || !RunsDraw(is_indexed)) {
+        return false;
+    }
+    // Nothing else to send since the run's first draw: every register as that draw had it but the
+    // first vertex.
+    if (!OnlyRegsChanged({PICA_REG_INDEX(pipeline.vertex_offset)}, held.regs)) {
+        return false;
+    }
+    const auto& pipeline = parse_pica.regs.internal.pipeline;
     if (held.vertices.size() + pipeline.num_vertices > MaxRunVertices) {
         return false;
     }
@@ -794,12 +753,55 @@ bool RenderThread::MergeDraw(bool is_indexed) {
     return true;
 }
 
+bool RenderThread::StartsStrip(bool is_indexed) const {
+    // Strips of 7 vertices or more, 16-bit indices: the quad heuristics look at draws of 6 or fewer.
+    static const bool off = SgxdFlag("nostripruns");
+    const auto& pipeline = parse_pica.regs.internal.pipeline;
+    return !off && is_indexed && parse_gs_bytes == 0 &&
+           pipeline.use_gs == Pica::PipelineRegs::UseGS::No &&
+           pipeline.triangle_topology == Pica::PipelineRegs::TriangleTopology::Strip &&
+           pipeline.index_array.format != 0 && pipeline.num_vertices >= 7;
+}
+
+bool RenderThread::JoinStrip(bool is_indexed) {
+    if (held_strips.draws == 0 || held_strips.draws >= MaxStripRunDraws ||
+        !StartsStrip(is_indexed)) {
+        return false;
+    }
+    constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
+    constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
+    if (!OnlyRegsChanged({IndexReg, NumReg}, held_strips.regs)) {
+        return false;
+    }
+    // Its register writes stay marked: they go with the next state, after the run's record.
+    const auto& regs = parse_pica.regs.internal.reg_array;
+    held_strips.list[held_strips.draws++] = {regs[IndexReg], regs[NumReg],
+                                             std::exchange(parse_indices, DrawIndexRange{})};
+    return true;
+}
+
 void RenderThread::FlushRun() {
-    if (held.draws == 0 || held_flushing) {
+    if ((held.draws == 0 && held_strips.draws == 0) || held_flushing) {
         return;
     }
     held_flushing = true;
-    if (held.draws == 1) {
+    if (held_strips.draws == 1) {
+        ParsedPut(Op::Draw, held_strips.list[0].indices, held_strips.is_indexed);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        tools_strips[2].fetch_add(1, std::memory_order_relaxed);
+#endif
+    } else if (held_strips.draws != 0) {
+        const u32 n = held_strips.draws;
+        u8* p = ParsedBegin(Op::StripRun, sizeof(u32) + n * sizeof(StripRunDraw));
+        std::memcpy(p, &n, sizeof(n));
+        std::memcpy(p + sizeof(n), held_strips.list.data(), n * sizeof(StripRunDraw));
+        ParsedCommit();
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        tools_strips[0].fetch_add(1, std::memory_order_relaxed);
+        tools_strips[1].fetch_add(n, std::memory_order_relaxed);
+        tools_strips[3].fetch_add(n == MaxStripRunDraws ? 1 : 0, std::memory_order_relaxed);
+#endif
+    } else if (held.draws == 1) {
         ParsedPut(Op::Draw, held.first_indices, 0);
     } else {
         const u32 count = static_cast<u32>(held.vertices.size());
@@ -809,12 +811,13 @@ void RenderThread::FlushRun() {
         ParsedCommit();
     }
     held.draws = 0;
+    held_strips.draws = 0;
     held_flushing = false;
     PublishParsed();
 }
 
 u8* RenderThread::ParsedBegin(Op op, u32 bytes, u16 extra) {
-    if (held.draws != 0 && !held_flushing) {
+    if ((held.draws != 0 || held_strips.draws != 0) && !held_flushing) {
         FlushRun();
     }
     const u32 need = static_cast<u32>(sizeof(Head)) + Align8(bytes);
@@ -951,6 +954,35 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count, u16 cleaned) {
     merged_draws.fetch_add(count, std::memory_order_relaxed);
     merged_runs.fetch_add(1, std::memory_order_relaxed);
 #endif
+}
+
+void RenderThread::DrawStripRun(const StripRunDraw* list, u32 n) {
+    // Each draw in full, with its index list and count; the first's after, as the run's record
+    // left them (the later draws' writes come with the next state).
+    auto& regs = render_pica.regs.internal.reg_array;
+    constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
+    constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
+    for (u32 k = 0; k < n; k++) {
+        StripRunDraw d;
+        std::memcpy(&d, list + k, sizeof(d));
+        regs[IndexReg] = d.index_reg;
+        regs[NumReg] = d.count;
+        render_pica.dirty_regs.Set(IndexReg);
+        render_pica.dirty_regs.Set(NumReg);
+        if (d.indices.scanned != 0) {
+            rasterizer.ScannedIndices(d.indices.lo, d.indices.hi);
+        }
+        rasterizer.GeometryCleaned(d.indices.cleaned);
+        [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(true);
+        DEBUG_ASSERT(drawn);
+        GsInvoked(render_pica);
+    }
+    StripRunDraw first;
+    std::memcpy(&first, list, sizeof(first));
+    regs[IndexReg] = first.index_reg;
+    regs[NumReg] = first.count;
+    render_pica.dirty_regs.Set(IndexReg);
+    render_pica.dirty_regs.Set(NumReg);
 }
 
 namespace {
@@ -2467,7 +2499,7 @@ void RenderThread::RunParsed(u32 seq) {
         } else if (head.op != Op::Wrap) {
 #ifdef VITA_DEBUG_TOOLS
             const bool tools_draw = head.op == Op::Draw || head.op == Op::MergedDraw ||
-                                    head.op == Op::DrawTriangles;
+                                    head.op == Op::StripRun || head.op == Op::DrawTriangles;
             const u64 tools_start = tools_draw ? sceKernelGetProcessTimeWide() : 0;
 #endif
             RunRecord(head, p + sizeof(Head));
@@ -4086,7 +4118,7 @@ void RenderThread::RunAvailable() {
             running_op.store(static_cast<u32>(head.op), std::memory_order_relaxed);
 #ifdef VITA_DEBUG_TOOLS
             const bool tools_draw = head.op == Op::Draw || head.op == Op::MergedDraw ||
-                                    head.op == Op::DrawTriangles;
+                                    head.op == Op::StripRun || head.op == Op::DrawTriangles;
             const u64 tools_start = tools_draw ? sceKernelGetProcessTimeWide() : 0;
 #endif
             RunRecord(head, p + sizeof(Head));
@@ -4156,6 +4188,7 @@ RenderThread::Stats::Kind RenderThread::KindOf(Op op) {
         return Stats::State;
     case Op::Draw:
     case Op::MergedDraw:
+    case Op::StripRun:
     case Op::ImmediateVertex:
     case Op::FlushImmediate:
     case Op::AddTriangle:
@@ -4385,6 +4418,12 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         u32 count;
         take(count);
         DrawMerged(reinterpret_cast<const u16*>(p + sizeof(count)), count, head.extra);
+        break;
+    }
+    case Op::StripRun: {
+        u32 n;
+        take(n);
+        DrawStripRun(reinterpret_cast<const StripRunDraw*>(p + sizeof(n)), n);
         break;
     }
     case Op::ImmediateVertex: {
