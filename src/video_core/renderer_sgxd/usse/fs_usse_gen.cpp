@@ -960,8 +960,9 @@ void FragmentEmitter::PlanInputs() {
     }
     // Per-vertex effect lighting reads no shadow: an effect (smoke, fire, sparks) is lit as if in
     // the open. Its shadow could only darken the alphas (PvEffectEligible refuses a shadowed
-    // light), and the read was a third of Monster Hunter XX's explosion smoke programs.
-    if (Pv()) {
+    // light), and the read was a third of Monster Hunter XX's explosion smoke programs. A draw
+    // that writes depth (pv_shadow: a ground layer) keeps it.
+    if (Pv() && !lighting.pv_shadow) {
         shadow_applied = false;
     }
     if (uses_lighting && lighting.enable_shadow && shadow_applied) {
@@ -4018,9 +4019,10 @@ void FragmentEmitter::PvLighting() {
     // each corner (vs_usse_gen.cpp, VertexEmitter::PvLighting), iterated as TEXCOORD4's half4.
     // The specular sum is zero; each alpha is the Fresnel table at the iterated N.V where its
     // enable_*_alpha asks, else 1. The sums leave in the forms Lighting's do, for what reads them
-    // after (U8Inputs, the F32 combiners). PlanInputs reads no shadow under per-vertex effect
-    // lighting, so uses_shadow is off and the shadow terms below fall away; were one read, each
-    // alpha that asks for it would take it (TmpShadow), the Fresnel value's or alone.
+    // after (U8Inputs, the F32 combiners). PlanInputs reads no shadow for an effect, so
+    // uses_shadow is off and the shadow terms below fall away; a surface's (pv_shadow) is read
+    // with the textures (TmpShadow), and each alpha that asks for it takes it, the Fresnel
+    // value's or alone.
     const auto& lighting = config.lighting;
     const Vec4Loc lit{Bank::PrimAttr, normquat_pa, true};
     const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
@@ -5806,8 +5808,9 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
 
 bool PvEffectEligible(const FSConfig& config) {
     const auto& lighting = config.lighting;
-    // A shadow on a light's term is the loop's to refuse; one on the alphas is not read
-    // (PlanInputs): the effect is lit as if unshadowed (Monster Hunter XX's explosion smoke).
+    // A shadow on a light's term is the loop's to refuse; one on the alphas is read only for a
+    // draw that writes depth (pv_shadow, PlanInputs), else the effect is lit as if unshadowed
+    // (Monster Hunter XX's explosion smoke).
     if (!lighting.enable || lighting.bump_mode != LightingRegs::LightingBumpMode::None ||
         lighting.src_num < 1 || lighting.src_num > 2 || config.framebuffer.shadow_rendering) {
         return false;

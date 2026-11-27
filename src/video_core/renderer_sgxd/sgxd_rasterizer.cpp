@@ -6074,6 +6074,13 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
     // PvEffectRequest asked for by the same rule), so the program reads the colour it made.
     if (pv_effect && Usse::PvEffectEligible(config)) {
         lighting.pv_effect.Assign(1);
+        // A draw that writes depth is a surface of the scene (a ground layer), not an effect: it
+        // keeps its shadow, which unread drew its polygons' edges across a monster's shadow.
+        const auto& dfb = regs.framebuffer.framebuffer;
+        const auto& dom = regs.framebuffer.output_merger;
+        if (dfb.allow_depth_stencil_write != 0 && dom.depth_write_enable) {
+            lighting.pv_shadow.Assign(1);
+        }
     }
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.
@@ -9711,7 +9718,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         static const std::vector<u32> cfg_keys = SgxdFlagValues("fsonly");
         static std::vector<u32> cfg_told;
         const u32 low = static_cast<u32>(last_fragment_key);
-        if (std::find(cfg_keys.begin(), cfg_keys.end(), low) != cfg_keys.end() &&
+        // pvkeys: also every program a draw lit per vertex (per-vertex effect lighting).
+        static const bool pv_keys = SgxdFlag("pvkeys");
+        if ((std::find(cfg_keys.begin(), cfg_keys.end(), low) != cfg_keys.end() ||
+             (pv_keys && draw_pv_effect)) &&
             std::find(cfg_told.begin(), cfg_told.end(), low) == cfg_told.end()) {
             cfg_told.push_back(low);
             const auto fc = FragmentConfig();

@@ -332,6 +332,10 @@ struct LightConfig {
         /// program made the colour): TEXCOORD4 brings the primary colour and N.V from the
         /// vertices, and the program reads only the Fresnel table.
         BitField<25, 1, u32> pv_effect;
+        /// sgxd: with pv_effect, the shadow still read (where the alphas ask for it): the draw
+        /// writes depth, a surface of the scene (Monster Hunter XX's ground layers) rather than
+        /// an effect, which is lit as if unshadowed.
+        BitField<26, 1, u32> pv_shadow;
     };
     LutConfig lut_d0{};
     LutConfig lut_d1{};
