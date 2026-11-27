@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <psp2/kernel/threadmgr.h>
 #include "common/logging/log.h"
@@ -18,7 +19,7 @@ namespace SgxdRenderer {
 
 namespace {
 
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
 const std::vector<std::string>& Flags() {
     static const std::vector<std::string> flags = [] {
         std::vector<std::string> out;
@@ -60,6 +61,17 @@ bool SgxdFlag(const char* name) {
     for (const auto& flag : Flags()) {
         if (flag == name) {
             return true;
+        }
+    }
+#elif defined(VITA_DEBUG_TOOLS)
+    // Tools builds measure speed: only the A/B switches their runs need, so every other flag keeps
+    // the default and the tools numbers stay comparable.
+    const std::string_view wanted{name};
+    if (wanted == "nostripruns" || wanted == "stripcheck") {
+        for (const auto& flag : Flags()) {
+            if (flag == wanted) {
+                return true;
+            }
         }
     }
 #else
