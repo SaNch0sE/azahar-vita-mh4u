@@ -1252,7 +1252,7 @@ public:
     /// The timed frame's stream-out renders, summed: [0] A0, [1] A1, [2] A1 of trails (the
     /// rasterizer sets tools_stream_trail around a trail draw's flush): renders, draws, TA us,
     /// 3D us.
-    std::array<std::array<u32, 4>, 3> tools_stream_times{};
+    std::array<std::array<u32, 4>, 4> tools_stream_times{}; ///< [3]: the side renders
     bool tools_stream_trail{};
     /// The open pass's number (a closed pass's in tools_pass_times).
     [[nodiscard]] u32 ToolsPassNumber() const {

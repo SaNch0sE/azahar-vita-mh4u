@@ -2384,9 +2384,11 @@ void RasterizerSgxd::ToolsTimingEnd() {
         const auto& s = backend.tools_stream_times;
         LOG_INFO(Render,
                  "slow frame {}: stream-out A0 {} renders {} draws TA {:.2f} ms; A1 {} renders {} "
-                 "draws TA {:.2f} ms; trails {} renders TA {:.2f} ms",
+                 "draws TA {:.2f} ms; trails {} renders TA {:.2f} ms; side {} renders {} draws "
+                 "TA {:.2f} ms 3D {:.2f} ms",
                  tools_timed_frames, s[0][0], s[0][1], s[0][2] / 1000.0, s[1][0], s[1][1],
-                 s[1][2] / 1000.0, s[2][0], s[2][2] / 1000.0);
+                 s[1][2] / 1000.0, s[2][0], s[2][2] / 1000.0, s[3][0], s[3][1], s[3][2] / 1000.0,
+                 s[3][3] / 1000.0);
     }
     std::sort(times.begin(), times.end(),
               [](const auto& a, const auto& b) { return a.d3_us + a.ta_us > b.d3_us + b.ta_us; });

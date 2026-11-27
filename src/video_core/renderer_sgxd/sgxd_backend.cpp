@@ -3561,6 +3561,23 @@ void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> lis
         &r.recipe, r.memory, untile_draws.data(), static_cast<unsigned>(list.size()));
     DEBUG_ASSERT_MSG(taken == 0, "sgxd: the side render's {} draws were not taken", list.size());
     sgxd_recipe_restage(&r.recipe, r.memory);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // The slow-frame recorder's frame: each side render on its own, timed.
+    if (tools_timing) {
+        u32 ta = 0, d3 = 0;
+        sgxd_session_time_renders = 1;
+        RenderSync(r, &ta, &d3);
+        sgxd_session_time_renders = 0;
+        r.fence = FenceAll();
+        auto& t = tools_stream_times[3];
+        t[0]++;
+        t[1] += static_cast<u32>(list.size());
+        t[2] += ta;
+        t[3] += d3;
+        NoteSent("side", static_cast<u32>(list.size()));
+        return;
+    }
+#endif
 #ifdef VITA_DIAGNOSTICS
     static const bool sync_side = SgxdFlag("syncside");
     if (sync_side && (replay_sync || SgxdFlag("syncpasses"))) {
