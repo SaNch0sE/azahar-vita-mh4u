@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/regex.hpp>
@@ -273,6 +274,30 @@ public:
                 pending.clear();
             }
             return;
+        }
+#endif
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        // The slow-frame recorder's reports also go to ux0:data/azahar/slowframes.txt, so a
+        // slowdown met in ordinary play (no PC on the debug channel) is kept. Appended across
+        // runs, started again past 4 MB; at most a frame's eight lines a second.
+        if (text.find("slow frame ") != std::string::npos) {
+            static FILE* file = [] {
+                const char* path = "ux0:data/azahar/slowframes.txt";
+                FILE* f = std::fopen(path, "ab");
+                if (f != nullptr && std::fseek(f, 0, SEEK_END) == 0 &&
+                    std::ftell(f) > 4 * 1024 * 1024) {
+                    std::fclose(f);
+                    f = std::fopen(path, "wb");
+                }
+                if (f != nullptr) {
+                    std::fputs("--- run started\n", f);
+                }
+                return f;
+            }();
+            if (file != nullptr) {
+                std::fwrite(text.data(), 1, text.size(), file);
+                std::fflush(file);
+            }
         }
 #endif
         sceClibPrintf("%s", text.c_str());
