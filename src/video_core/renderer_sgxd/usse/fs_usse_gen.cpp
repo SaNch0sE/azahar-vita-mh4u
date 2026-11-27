@@ -4012,7 +4012,8 @@ void FragmentEmitter::PvLighting() {
     // each corner (vs_usse_gen.cpp, VertexEmitter::PvLighting), iterated as TEXCOORD4's half4.
     // The specular sum is zero; each alpha is the Fresnel table at the iterated N.V where its
     // enable_*_alpha asks, else 1. The sums leave in the forms Lighting's do, for what reads them
-    // after (U8Inputs, the F32 combiners).
+    // after (U8Inputs, the F32 combiners). A shadow on the alphas is the pixel's (TmpShadow, read
+    // with the textures): each alpha that asks for it times it, the Fresnel value's or alone.
     const auto& lighting = config.lighting;
     const Vec4Loc lit{Bank::PrimAttr, normquat_pa, true};
     const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
@@ -4073,10 +4074,22 @@ void FragmentEmitter::PvLighting() {
             e.Vec(VecOp::Mul, into, {into.reg, XYZW}, factors[k]);
         }
     }
-    // An alpha lane of `sum` (an internal register): the Fresnel value or 1.
-    const auto alpha = [&](Reg sum, bool with_fresnel) {
-        if (with_fresnel) {
+    const bool shadow_alpha = uses_shadow && lighting.shadow_alpha;
+    const bool shadow_primary = shadow_alpha && uses_primary_color &&
+                                lighting.enable_primary_alpha && reads.primary_alpha;
+    const bool shadow_secondary = shadow_alpha && uses_secondary_color &&
+                                  lighting.enable_secondary_alpha && reads.secondary_alpha;
+    const Vec4Loc shadow{Bank::Virtual, TmpShadow};
+    const Src shadow_a = shadow_scalar ? Src{shadow.Pair(0), XXXX} : Src{shadow.Pair(1), YYYY};
+    // An alpha lane of `sum` (an internal register): the Fresnel value, the shadow, their
+    // product, or 1.
+    const auto alpha = [&](Reg sum, bool with_fresnel, bool with_shadow) {
+        if (with_fresnel && with_shadow) {
+            e.Vec(VecOp::Mul, {sum, 0x8}, fresnel_value, shadow_a, Pred::None, true);
+        } else if (with_fresnel) {
             e.Vec(VecOp::Add, {sum, 0x8}, fresnel_value, ConstZero, Pred::None, true);
+        } else if (with_shadow) {
+            e.Vec(VecOp::Add, {sum, 0x8}, shadow_a, ConstZero, Pred::None, true);
         } else {
             e.Vec(VecOp::Add, {sum, 0x8}, ConstZero, ConstOne, Pred::None, true);
         }
@@ -4090,7 +4103,7 @@ void FragmentEmitter::PvLighting() {
             e.PackU8F16(Reg::V(TmpU8Diffuse), lit.Pair(0), xyzz);
         } else {
             LoadVec4(I0, lit);
-            alpha(I0, fresnel_primary);
+            alpha(I0, fresnel_primary, shadow_primary);
             if (u8_lighting_packed) {
                 e.PackU8(Reg::V(TmpU8Diffuse), I0, I0);
             } else {
@@ -4103,14 +4116,15 @@ void FragmentEmitter::PvLighting() {
         }
     }
     if (uses_secondary_color) {
-        if (u8_lighting_packed && fresnel_secondary && reads.secondary_lanes == 0) {
+        if (u8_lighting_packed && fresnel_secondary && !shadow_secondary &&
+            reads.secondary_lanes == 0) {
             // No colour lane read: every byte the Fresnel value's, packed from where it lies.
             e.PackU8(Reg::V(TmpU8Specular), fresnel_value.reg, fresnel_value.reg,
                      PackSelBroadcast(0));
         } else {
             e.MoveInternal({I1, 0xf}, {Reg::C(0), XXXX}, Pred::None, true);
             if (reads.secondary_alpha) {
-                alpha(I1, fresnel_secondary);
+                alpha(I1, fresnel_secondary, shadow_secondary);
             }
             if (u8_lighting_packed) {
                 e.PackU8(Reg::V(TmpU8Specular), I1, I1,
@@ -5769,12 +5783,10 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
 
 bool PvEffectEligible(const FSConfig& config) {
     const auto& lighting = config.lighting;
-    // A shadow only where something applies it (as the emitter's shadow_applied): its alpha, or a
-    // light's term, which the loop below excludes. Monster Hunter XX's mist has the shadow enabled
-    // with nothing taking it.
+    // A shadow on a light's term is the loop's to refuse; one on the alphas is read at each pixel
+    // and multiplied in by PvLighting, as Lighting does (Monster Hunter XX's explosion smoke).
     if (!lighting.enable || lighting.bump_mode != LightingRegs::LightingBumpMode::None ||
-        (lighting.enable_shadow && lighting.shadow_alpha) || lighting.src_num < 1 ||
-        lighting.src_num > 2 || config.framebuffer.shadow_rendering) {
+        lighting.src_num < 1 || lighting.src_num > 2 || config.framebuffer.shadow_rendering) {
         return false;
     }
     // Every light lit by its diffuse and ambient colours alone: directional (its vector the
