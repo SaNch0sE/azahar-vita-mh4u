@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include "common/common_types.h"
 #include "sgxd_program.h"
@@ -167,6 +168,9 @@ public:
                      bool fresh = false);
     /// sa_address: pass data allocated for the draw (never looked up), or with sa_words 0 any.
     PdsRef SecondaryPds(u32 sa_address, u32 sa_words, u32 doutu0);
+    /// Whether SecondaryPds(sa_address, sa_words, doutu0) would answer `va` again rather than
+    /// place another copy of the program (its secondary_kept slot taken by another image since).
+    [[nodiscard]] bool SecondaryHeld(u32 sa_address, u32 sa_words, u32 doutu0, u32 va) const;
     PdsRef BlitPixelPds(u32 doutu0, const u32 tex[4]);
     PdsRef ScreenPixelPds(u32 doutu0, const u32 tex[4]);
     PdsRef MergePixelPds(u32 doutu0, const u32 tex0[4], const u32 tex1[4]);
@@ -389,6 +393,28 @@ public:
 #endif
     /// Adds a draw to the open pass; its programs are copied.
     void Draw(const SgxdRecipeDraw& draw, const SgxdRecipeDrawPrograms& programs);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    /// Tools builds' strip-run check (sgxd flag stripcheck): the last Draw call's copies, null
+    /// when the open pass has none; and the Draw calls so far.
+    [[nodiscard]] std::pair<const SgxdRecipeDraw*, const SgxdRecipeDrawPrograms*> LastDraw() const {
+        if (!in_pass || draw_count == 0) {
+            return {nullptr, nullptr};
+        }
+        return {&tools_last_draw, &tools_last_programs};
+    }
+    [[nodiscard]] u32 DrawCalls() const {
+        return tools_draw_calls;
+    }
+    /// The PDS arena's cursor: moves whenever a program is placed.
+    [[nodiscard]] u32 PdsUsed() const {
+        return pds_used;
+    }
+#endif
+    /// Steps wherever FlipPdsHalf forgets the placed PDS programs (pds_index, secondary_kept): a
+    /// draw's programs found before hold while it stays the same.
+    [[nodiscard]] u32 PdsGeneration() const {
+        return pds_generation;
+    }
     /// A range of cached guest memory the pass reads, cleaned from the CPU's cache at EndPass.
     void ReadsCached(const u8* cpu, u32 bytes);
     /// Renders the pass as an async list: returns once the TA is kicked, with the TA's and the
@@ -1147,6 +1173,12 @@ private:
         PdsRef ref;
     };
     std::array<SecondaryKept, 16> secondary_kept{};
+    u32 pds_generation{}; ///< PdsGeneration
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    SgxdRecipeDraw tools_last_draw{};
+    SgxdRecipeDrawPrograms tools_last_programs{};
+    u32 tools_draw_calls{};
+#endif
     /// The template for a key without addresses, built by `build` on a miss; null if it fails.
     template <typename Build>
     PdsTemplate* TemplatePds(const u32* key, u32 words, Build&& build);

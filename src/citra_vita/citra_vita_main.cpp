@@ -2219,6 +2219,21 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     sites += fmt::format("; strip runs: runs {} draws in runs {} (full {}), "
                                          "held alone {}",
                                          st[0], st[1], st[3], st[2]);
+                    // The strip-run check (sgxd flag stripcheck): draws checked, mismatches since
+                    // the start and the first one's field, DrawSharedStrip's answers by refusal.
+                    static std::array<u64, 10> last_sc{};
+                    std::array<u64, 10> sc{};
+                    for (int k = 0; k < 10; k++) {
+                        sc[k] = SgxdRenderer::RenderThread::ToolsStripCheck(k) - last_sc[k];
+                        last_sc[k] += sc[k];
+                    }
+                    sites += fmt::format("; strip check: checked {} mismatches {} (first {}), "
+                                         "none {} not kept {} programs changed {} pending {} "
+                                         "secondary copied {} pass changed {} no room {} "
+                                         "index range {}",
+                                         sc[0], last_sc[1],
+                                         SgxdRenderer::RenderThread::ToolsStripCheckField(),
+                                         sc[2], sc[3], sc[4], sc[5], sc[6], sc[7], sc[8], sc[9]);
                     sites += fmt::format("; repeats {} us: uniforms {} textures {} pass {} "
                                          "vertex {} fragment {} submit {}; differing:{}",
                                          rp[6], rp[0], rp[1], rp[2], rp[3], rp[4], rp[5], rr);

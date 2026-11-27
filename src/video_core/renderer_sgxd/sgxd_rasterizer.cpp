@@ -4697,6 +4697,10 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
                           *used,
                           pv};
     const u64 key = VertexKeyOf(config, in);
+    if (strip_run_armed && !shared_strip.ok && mode == Usse::VsMode::Draw) {
+        shared_strip.vertex_key = key;
+        shared_strip.vertex_in = in;
+    }
     if (VertexProgram* const found = vertex_programs.Find(key)) {
         VertexProgram& v = *found;
         if (!v.tier2_queued && ++v.draws >= Tier2Draws) {
@@ -4852,6 +4856,7 @@ void RasterizerSgxd::FlushPrograms() {
     last_layout = nullptr;
     last_passthrough = nullptr;
     program_flushes++;
+    programs_generation++;
 }
 
 RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program usse,
@@ -6322,6 +6327,7 @@ void RasterizerSgxd::InstallFragmentTier2(u64 key, const Usse::Program& program)
 }
 
 void RasterizerSgxd::InstallTier2() {
+    programs_generation++;
     for (ShaderTier2::Result& result : tier2->Take()) {
         if (result.vertex) {
             InstallVertexTier2(result);
@@ -6990,6 +6996,160 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
     return drawn;
 }
 
+namespace {
+/// A pass holds SgxdBackend::MaxDraws draws; a draw adds at most this many (Draw).
+constexpr u32 DrawAddsAtMost = 5;
+} // Anonymous namespace
+
+void RasterizerSgxd::BeginStripRun() {
+    shared_strip = {};
+    strip_run_armed = true;
+}
+
+void RasterizerSgxd::EndStripRun() {
+    strip_run_armed = false;
+    shared_strip = {};
+}
+
+RasterizerSgxd::StripRefusal RasterizerSgxd::DrawSharedStrip(
+    u32 count, PAddr index_address, std::optional<std::pair<u32, u32>> scanned, u16 cleaned,
+    bool submit) {
+    const auto& pipeline = regs.pipeline;
+    StripRefusal why = StripRefusal::None;
+    // Kept, and nothing since that Draw would do first: new programs (InstallTier2,
+    // FlushPrograms) or a DMA's cache work.
+    if (!shared_strip.ok) {
+        why = StripRefusal::NotKept;
+    } else if (shared_strip.programs_generation != programs_generation ||
+               (tier2 && tier2->Ready())) {
+        why = StripRefusal::ProgramsChanged;
+    } else if (backend.RetirePending() || (backend.CodeFree() < SgxdBackend::CodeBytes / 2 &&
+                                           backend.PassMark() != flush_mark)) {
+        why = StripRefusal::Pending;
+    } else if (!backend.InPass() || backend.PassMark() != shared_strip.pass_mark ||
+               backend.DataOpens() != shared_strip.data_opens ||
+               backend.PdsGeneration() != shared_strip.pds_generation ||
+               pass_colour.addr != shared_strip.colour) {
+        why = StripRefusal::PassChanged;
+    } else if (!backend.SecondaryHeld(shared_strip.vsa, shared_strip.vsa_words,
+                                      shared_strip.vsa_doutu0, shared_strip.p.vsec) ||
+               !backend.SecondaryHeld(shared_strip.fsa, shared_strip.fsa_words,
+                                      shared_strip.fsa_doutu0, shared_strip.p.fsec)) {
+        // The full path would place another copy of a secondary program (its slot in
+        // secondary_kept taken since): the GPU would get that copy's address.
+        why = StripRefusal::SecondaryCopied;
+    } else if (backend.PassDraws() + DrawAddsAtMost > SgxdBackend::MaxDraws ||
+               backend.DataLeft() < count * 2 + (16u << 10)) {
+        // As Draw ends the pass: a pass full of draws, or of data.
+        why = StripRefusal::NoRoom;
+    } else if (pipeline.index_array.format == 0 || count < 7) {
+        // Only 16-bit lists of 7 or more (the kept draw's are). A list the parse did not scan
+        // (vertices in a resource or VRAM) is scanned by ReadIndexedList as the full path's is.
+        why = StripRefusal::IndexRange;
+    }
+    if (why == StripRefusal::None) {
+        scanned_indices = scanned;
+        cleaned_geometry = cleaned;
+        const auto describe = [&] {
+            return fmt::format("indexed draw, topology strip, {} vertices (a strip run's)", count);
+        };
+        const std::span<const VertexFeed> feeds{shared_strip.feeds.data(), shared_strip.feed_count};
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        std::optional<ToolsDrawSections> tools_sections;
+        if (submit) {
+            tools_sections.emplace();
+            tools_sections->Mark(2);
+            tools_sections->repeat =
+                ToolsMergeNote(regs, pica.gs_setup, pica.vs_setup, false, true);
+        }
+#endif
+        const IndexedReads r = ReadIndexedList(feeds, shared_strip.input_regs, index_address, true,
+                                               count, Usse::VsMode::Draw, describe);
+        if (!r.mapped) {
+            why = StripRefusal::IndexRange;
+        } else {
+            CleanVertexReads(feeds, shared_strip.input_regs, 0, r);
+            SgxdRecipeDrawPrograms p = shared_strip.p;
+            p.indices = r.indices_gpu;
+            SgxdRecipeDraw draw = shared_strip.draw;
+            draw.count = count;
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+            last_shared = {draw, p};
+            if (tools_sections) {
+                tools_sections->Mark(3);
+                tools_sections->Mark(4);
+            }
+#endif
+            if (submit) {
+                // As Draw counts a draw.
+                draw_serial++;
+                bool skipped = false;
+#ifdef VITA_DIAGNOSTICS
+                VprofDraw(true, false, count);
+                skipped = ReplaySkipsDraw();
+#endif
+                if (!skipped) {
+                    backend.Draw(draw, p);
+                    pass_guest_draws++;
+                    if (const auto [lo, hi] = DrawnRows(); lo < hi) {
+                        const bool first = pass_drawn_lo >= pass_drawn_hi;
+                        pass_drawn_lo = first ? lo : std::min(pass_drawn_lo, lo);
+                        pass_drawn_hi = first ? hi : std::max(pass_drawn_hi, hi);
+                    }
+                    // The programs' second-tier steps, as VertexProgramFor's and
+                    // FragmentProgramFor's for every draw of theirs.
+                    VertexProgram& v = *shared_strip.vertex;
+                    if (!v.tier2_queued && ++v.draws >= Tier2Draws) {
+                        v.tier2_queued = true;
+                        if (tier2) {
+                            const Pica::Shader::Generator::PicaVSConfig config{regs, pica.vs_setup};
+                            tier2->QueueVertex(shared_strip.vertex_key,
+                                               VertexRequestOf(config, pica.vs_setup,
+                                                               shared_strip.vertex_in));
+                        }
+                    }
+                    FragmentProgram& f = *shared_strip.fragment;
+                    if (!f.tier2_queued && ++f.draws >= Tier2Draws) {
+                        f.tier2_queued = true;
+                        if (tier2) {
+                            QueueFragmentTier2(shared_strip.fragment_key, FragmentConfig());
+                        }
+                    }
+#ifdef VITA_DIAGNOSTICS
+                    PerflogDraw(describe, draw.isp, shared_strip.blend, p);
+#endif
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+                    if (backend.tools_timing) {
+                        const u32 pass = backend.ToolsPassNumber();
+                        const u64 key = shared_strip.fragment_key;
+                        auto it = std::find_if(tools_tally.begin(), tools_tally.end(),
+                                               [&](const auto& t) {
+                                                   return t.pass == pass && t.key == key;
+                                               });
+                        if (it == tools_tally.end()) {
+                            tools_tally.push_back({pass, key, 0, 0, 0});
+                            it = tools_tally.end() - 1;
+                        }
+                        const u32 type = draw.isp >> 25 & 7u;
+                        it->draws++;
+                        it->translucent += type == 1 || type == 2 ? 1 : 0;
+                        it->vertices += count;
+                    }
+#endif
+                }
+            }
+        }
+    }
+    // Refused: the draw takes the full path, and that Draw keeps its own submission.
+    if (why != StripRefusal::None) {
+        shared_strip.ok = false;
+    }
+    scanned_indices.reset();
+    cleaned_geometry = 0;
+    gs_indices_set = false;
+    return why;
+}
+
 RasterizerSgxd::VertexLayout& RasterizerSgxd::VertexLayoutFor() {
     if (layout_regs_dirty) {
         layout_regs_dirty = false;
@@ -7429,6 +7589,14 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     if (!immediate) {
         CleanVertexReads(std::span<const VertexFeed>{feeds.data(), feed_count}, vp.input_regs,
                          first, reads);
+    }
+    // A strip run's draw that may be kept (Draw): what DrawSharedStrip reads and cleans again.
+    if (strip_run_armed && !shared_strip.ok && !immediate && mode == Usse::VsMode::Draw) {
+        shared_strip.feeds = feeds;
+        shared_strip.feed_count = feed_count;
+        shared_strip.input_regs = vp.input_regs;
+        // A value of vertex_programs (VertexProgramFor): never a const object.
+        shared_strip.vertex = const_cast<VertexProgram*>(program);
     }
 
 
@@ -8777,7 +8945,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 #ifdef VITA_DIAGNOSTICS
     const bool diag_self_read = backend.InPass() && TexturesReadPassColour();
 #endif
-    if (backend.InPass() && TexturesReadPassColour()) {
+    // Asked outside a pass too while a strip run may keep the draw (DrawSharedStrip).
+    const bool reads_pass_colour =
+        (backend.InPass() || (strip_run_armed && !shared_strip.ok)) && TexturesReadPassColour();
+    if (backend.InPass() && reads_pass_colour) {
         EndPass("a draw reading its own colour buffer");
     }
 #ifdef VITA_DIAGNOSTICS
@@ -8965,7 +9136,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // A pass holds SgxdBackend::MaxDraws draws. A draw adds at most five: the viewport's mask, every
     // tile touched for guest memory's depth, the margin's mask, a flush object before an alpha-keeping
     // draw, and its own. A pass with fewer left ends, and the draw goes on in the next, loaded.
-    constexpr u32 DrawAddsAtMost = 5;
     if (backend.InPass() && backend.PassDraws() + DrawAddsAtMost > SgxdBackend::MaxDraws) {
         EndPass("a pass full of draws");
     }
@@ -9845,6 +10015,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // else 1/w. The depths stored are these, and a pass's Z-buffered draws do not compare with them as
     // the PICA's would.
     u32 mte = 0;
+    bool depth_fitted = false; // FitWDepth or MapZOnW ran: a strip run does not keep the draw
     if (regs.rasterizer.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::WBuffering &&
         !regs.framebuffer.IsShadowRendering()) {
         const bool grows = fs_data.depth_offset - fs_data.depth_scale > 0.0f;
@@ -9852,6 +10023,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             pass_ta_w = true;
             if (!pass_w_map.fitted) {
                 FitWDepth(is_indexed, immediate, count, grows);
+                depth_fitted = true;
             }
         }
         // K at or below the draw's near plane, from its position rows or the pass's fit. Depths stored
@@ -9874,6 +10046,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                !regs.framebuffer.IsShadowRendering()) {
         // A Z-buffered draw testing against them (the PICA takes the depth mode per draw).
         [[maybe_unused]] const bool mapped = MapZOnW(is_indexed, immediate, count, p.viewport);
+        depth_fitted = true;
     }
     p.primitive = primitive;
 
@@ -9914,6 +10087,56 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                             (static_cast<u32>(PassEdge(pass_part.y1)) - 1) / 32);
     const SgxdRecipeDraw draw{0, stage.count, isp, SGXD_R_FPRIM,
                               CullMode(regs.rasterizer.cull_mode), clip, nullptr, ispc, mte};
+    if (strip_run_armed && !shared_strip.ok) {
+        // A strip run's draw another may share (DrawSharedStrip): one whose submission depends on
+        // its registers and the open pass alone, which changed nothing a later draw would see
+        // apart from what it drew, and which samples nothing of the pass's own buffers (a later
+        // draw's full path would end the pass for that).
+        const auto samples_targets = [&] {
+            const u32 sampled = Usse::SampledTextureUnits(FragmentConfig());
+            const PAddr depth_lo = fb.GetDepthBufferPhysicalAddress();
+            const PAddr depth_hi =
+                depth_lo + buffer.width * buffer.height *
+                               FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
+            for (u32 unit = 0; unit < 3; unit++) {
+                if ((sampled >> unit & 1) == 0) {
+                    continue;
+                }
+                const UnitRead& r = unit_reads[unit];
+                for (u32 k = 0; k < r.parts; k++) {
+                    if ((r.lo[k] < buffer.End() && buffer.addr < r.hi[k]) ||
+                        (has_depth && r.lo[k] < depth_hi && depth_lo < r.hi[k])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        shared_strip.ok = !immediate && is_indexed && !geometry &&
+                          pipeline.triangle_topology == Topology::Strip &&
+                          pipeline.index_array.format != 0 && count >= 7 && !stage.fresh &&
+                          !keep_alpha_opaque && draw_own_pixel == 0 && !depth_fitted &&
+                          depth_units == 0 && owned_units == 0 && !reads_pass_colour &&
+                          backend.InPass() && !samples_targets();
+        if (shared_strip.ok) {
+            shared_strip.draw = draw;
+            shared_strip.p = p;
+            shared_strip.pass_mark = backend.PassMark();
+            shared_strip.data_opens = backend.DataOpens();
+            shared_strip.pds_generation = backend.PdsGeneration();
+            shared_strip.colour = pass_colour.addr;
+            shared_strip.programs_generation = programs_generation;
+            shared_strip.fragment = last_fragment;
+            shared_strip.fragment_key = last_fragment_key;
+            shared_strip.vsa = vsa.gpu;
+            shared_strip.vsa_words = vsec_sa;
+            shared_strip.vsa_doutu0 = vp.secondary_doutu0;
+            shared_strip.fsa = fsa.gpu;
+            shared_strip.fsa_words = fsa_words;
+            shared_strip.fsa_doutu0 = fp.secondary_doutu0;
+            shared_strip.blend = blend;
+        }
+    }
     if (keep_alpha_opaque) {
         backend.DrawKeepingAlpha(draw, p);
     } else {

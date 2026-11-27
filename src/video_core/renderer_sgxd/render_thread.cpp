@@ -235,6 +235,133 @@ std::array<std::atomic<u64>, 4> tools_strips{};
 u64 RenderThread::ToolsStrips(int which) {
     return tools_strips[which].load(std::memory_order_relaxed);
 }
+
+namespace {
+/// The strip-run check's counts (RenderThread::ToolsStripCheck) and its first mismatch's field.
+constexpr u32 StripRefusals = static_cast<u32>(RasterizerSgxd::StripRefusal::Count_);
+std::array<std::atomic<u64>, 2 + StripRefusals> tools_strip_check{};
+std::atomic<const char*> tools_strip_field{"-"};
+
+/// A submission's fields as words, the viewport's floats bitwise; the draw's programs pointer
+/// left out (each submission's own copy).
+constexpr std::array<const char*, 31> StripFieldNames{
+    "first",      "count",      "isp",         "fprim",       "cull",        "clip",
+    "ispc",       "mte",        "p.vspds",     "p.vspds_units", "p.vdm_w2",  "p.vdm_w4",
+    "p.vdm_w5",   "p.vsec",     "p.vsec_units", "p.vsec_sa",  "p.fsec",      "p.fsec_units",
+    "p.fprim",    "p.fprim_units", "p.pixel_size", "p.outselects", "p.texsize", "p.viewport",
+    "p.indices",  "p.primitive", "draw calls", "no draw", "pass ended", "allocated", "-"};
+constexpr u32 StripFieldViewport = 23;
+constexpr u32 StripFieldDrawCalls = 26, StripFieldNoDraw = 27, StripFieldPassEnded = 28,
+              StripFieldAllocated = 29;
+constexpr u32 StripFieldWords = 26 + 5; // the viewport is six words
+// Every word of both structs is compared (SgxdRecipeDraw's programs pointer aside): a new field
+// breaks the build here until StripWords takes it.
+static_assert(sizeof(SgxdRecipeDrawPrograms) == 23 * sizeof(u32));
+static_assert(sizeof(SgxdRecipeDraw) == 8 * sizeof(u32) + sizeof(const SgxdRecipeDrawPrograms*));
+
+/// The backend's pass and allocation state before a checked draw's full path.
+struct StripPassState {
+    bool in_pass;
+    u32 pass_mark, data_opens, pds_generation, data_left, pds_used;
+    static StripPassState Of(const SgxdBackend& b) {
+        return {b.InPass(), b.PassMark(), b.DataOpens(), b.PdsGeneration(), b.DataLeft(),
+                b.PdsUsed()};
+    }
+};
+std::array<u32, StripFieldWords> StripWords(const SgxdRecipeDraw& d,
+                                            const SgxdRecipeDrawPrograms& p) {
+    std::array<u32, StripFieldWords> w{d.first,      d.count,         d.isp,        d.fprim,
+                                       d.cull,       d.clip,          d.ispc,       d.mte,
+                                       p.vspds,      p.vspds_units,   p.vdm_w2,     p.vdm_w4,
+                                       p.vdm_w5,     p.vsec,          p.vsec_units, p.vsec_sa,
+                                       p.fsec,       p.fsec_units,    p.fprim,      p.fprim_units,
+                                       p.pixel_size, p.outselects,    p.texsize};
+    for (u32 k = 0; k < 6; k++) {
+        w[StripFieldViewport + k] = std::bit_cast<u32>(p.viewport[k]);
+    }
+    w[StripFieldViewport + 6] = p.indices;
+    w[StripFieldViewport + 7] = p.primitive;
+    return w;
+}
+/// The field a word is in.
+u32 StripFieldOf(u32 word) {
+    return word < StripFieldViewport       ? word
+           : word < StripFieldViewport + 6 ? StripFieldViewport
+                                           : word - 5;
+}
+
+/// The shared submission against the one the full path drew after it (`calls`: the backend's
+/// Draw calls before the full path).
+void StripCheckCompare(const RasterizerSgxd& rasterizer, u32 calls,
+                       const StripPassState& before) {
+    static u32 logged = 0;
+    const SgxdBackend& backend = rasterizer.ToolsBackend();
+    const auto& shared = rasterizer.LastShared();
+    const auto [draw, programs] = backend.LastDraw();
+    const StripPassState after = StripPassState::Of(backend);
+    std::string differ;
+    u32 first = ~0u;
+    if (backend.DrawCalls() - calls != 1) {
+        first = StripFieldDrawCalls;
+        differ = fmt::format(" draw calls: 1 shared, {} full", backend.DrawCalls() - calls);
+    } else if (!draw || !programs) {
+        first = StripFieldNoDraw;
+        differ = " no draw: the full path's pass has none";
+    } else if (after.in_pass != before.in_pass || after.pass_mark != before.pass_mark ||
+               after.data_opens != before.data_opens ||
+               after.pds_generation != before.pds_generation) {
+        // The full path ended the pass (or opened another): the shared draw would not have.
+        first = StripFieldPassEnded;
+        differ = fmt::format(" pass ended: in pass {} -> {}, mark {} -> {}, data opens {} -> {}, "
+                             "PDS generation {} -> {}",
+                             before.in_pass, after.in_pass, before.pass_mark, after.pass_mark,
+                             before.data_opens, after.data_opens, before.pds_generation,
+                             after.pds_generation);
+    } else if (after.data_left != before.data_left || after.pds_used != before.pds_used) {
+        // The full path took pass data or placed a PDS program; the shared one takes neither.
+        first = StripFieldAllocated;
+        differ = fmt::format(" allocated: pass data {} bytes, PDS {} bytes",
+                             before.data_left - after.data_left,
+                             after.pds_used - before.pds_used);
+    } else {
+        const auto a = StripWords(shared.draw, shared.p);
+        const auto b = StripWords(*draw, *programs);
+        for (u32 k = 0; k < StripFieldWords; k++) {
+            if (a[k] != b[k]) {
+                const u32 field = StripFieldOf(k);
+                first = std::min(first, field);
+                differ += field == StripFieldViewport
+                              ? fmt::format(" {}[{}]: {} shared, {} full", StripFieldNames[field],
+                                            k - StripFieldViewport, std::bit_cast<float>(a[k]),
+                                            std::bit_cast<float>(b[k]))
+                              : fmt::format(" {}: {:#x} shared, {:#x} full",
+                                            StripFieldNames[field], a[k], b[k]);
+            }
+        }
+    }
+    tools_strip_check[0].fetch_add(1, std::memory_order_relaxed);
+    if (first == ~0u) {
+        return;
+    }
+    tools_strip_check[1].fetch_add(1, std::memory_order_relaxed);
+    const char* none = "-";
+    tools_strip_field.compare_exchange_strong(none, StripFieldNames[first],
+                                              std::memory_order_relaxed);
+    if (logged < 8) {
+        logged++;
+        LOG_ERROR(Render, "sgxd: strip check: a shared draw differs from the full path's:{}",
+                  differ);
+    }
+}
+} // Anonymous namespace
+
+u64 RenderThread::ToolsStripCheck(int which) {
+    return tools_strip_check[which].load(std::memory_order_relaxed);
+}
+
+const char* RenderThread::ToolsStripCheckField() {
+    return tools_strip_field.load(std::memory_order_relaxed);
+}
 #endif
 
 class RenderThread::ParsedOutput final : public VideoCore::RasterizerInterface {
@@ -962,6 +1089,12 @@ void RenderThread::DrawStripRun(const StripRunDraw* list, u32 n) {
     auto& regs = render_pica.regs.internal.reg_array;
     constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
     constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // Tools builds' check: each later draw's shared submission built first (not drawn), then
+    // compared with what its full path drew.
+    static const bool check = SgxdFlag("stripcheck");
+#endif
+    rasterizer.BeginStripRun();
     for (u32 k = 0; k < n; k++) {
         StripRunDraw d;
         std::memcpy(&d, list + k, sizeof(d));
@@ -969,6 +1102,25 @@ void RenderThread::DrawStripRun(const StripRunDraw* list, u32 n) {
         regs[NumReg] = d.count;
         render_pica.dirty_regs.Set(IndexReg);
         render_pica.dirty_regs.Set(NumReg);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        bool compare = false;
+        u32 calls = 0;
+        StripPassState before{};
+        if (check && k != 0) {
+            const auto& pipeline = render_pica.regs.internal.pipeline;
+            const PAddr index_address =
+                pipeline.vertex_attributes.GetPhysicalBaseAddress() + pipeline.index_array.offset;
+            const auto scanned = d.indices.scanned != 0
+                                     ? std::optional{std::pair<u32, u32>{d.indices.lo, d.indices.hi}}
+                                     : std::nullopt;
+            const RasterizerSgxd::StripRefusal why = rasterizer.DrawSharedStrip(
+                d.count, index_address, scanned, d.indices.cleaned, false);
+            tools_strip_check[2 + static_cast<u32>(why)].fetch_add(1, std::memory_order_relaxed);
+            compare = why == RasterizerSgxd::StripRefusal::None;
+            calls = rasterizer.ToolsBackend().DrawCalls();
+            before = StripPassState::Of(rasterizer.ToolsBackend());
+        }
+#endif
         if (d.indices.scanned != 0) {
             rasterizer.ScannedIndices(d.indices.lo, d.indices.hi);
         }
@@ -976,7 +1128,13 @@ void RenderThread::DrawStripRun(const StripRunDraw* list, u32 n) {
         [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(true);
         DEBUG_ASSERT(drawn);
         GsInvoked(render_pica);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        if (compare) {
+            StripCheckCompare(rasterizer, calls, before);
+        }
+#endif
     }
+    rasterizer.EndStripRun();
     StripRunDraw first;
     std::memcpy(&first, list, sizeof(first));
     regs[IndexReg] = first.index_reg;

@@ -1334,6 +1334,15 @@ SgxdBackend::PdsRef SgxdBackend::SecondaryPds(u32 sa_address, u32 sa_words, u32 
     return ref;
 }
 
+bool SgxdBackend::SecondaryHeld(u32 sa_address, u32 sa_words, u32 doutu0, u32 va) const {
+    if (sa_words == 0) {
+        return true; // KeyedPds: found by its words while the arena does not flip
+    }
+    const SecondaryKept& kept = secondary_kept[(sa_address >> 4) & (secondary_kept.size() - 1)];
+    return kept.address == sa_address && kept.words == sa_words && kept.doutu0 == doutu0 &&
+           kept.ref.va == va;
+}
+
 SgxdBackend::PdsRef SgxdBackend::BlitPixelPds(u32 doutu0, const u32 tex[4]) {
     const u32 key[6] = {TagBlitPixel, doutu0, tex[0], tex[1], tex[2], tex[3]};
     return KeyedPds(key, 6, [&](SgxdPdsProgram& pds) {
@@ -1432,6 +1441,7 @@ void SgxdBackend::FlipPdsHalf() {
     pds_fence[pds_half] = FenceAll();
     pds_index.Clear();
     secondary_kept = {};
+    pds_generation++;
     pds_index_programs = 0;
     pds_window = window;
     pds_half = other;
@@ -2473,6 +2483,11 @@ void SgxdBackend::Draw(const SgxdRecipeDraw& draw, const SgxdRecipeDrawPrograms&
     draws[draw_count] = draw;
     draws[draw_count].programs = &programs[draw_count];
     draw_count++;
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    tools_last_draw = draw;
+    tools_last_programs = program;
+    tools_draw_calls++;
+#endif
     // An opaque or punch-through object (PASSTYPE 0 or 4) writing tags with DCMP not NEVER: the
     // alpha is pending until a translucent object covers it (OpaqueKeepingAlpha).
     const u32 type = draw.isp >> 25 & 7u;

@@ -97,6 +97,13 @@ public:
     [[nodiscard]] static u64 ToolsRenderCounter(int which);
     /// Tools builds' cpu line: the parse's indexed strip runs (tools_strips).
     [[nodiscard]] static u64 ToolsStrips(int which);
+    /// Tools builds' cpu line, the strip-run check (sgxd flag stripcheck, DrawStripRun): 0 the
+    /// draws checked, 1 those whose shared submission differs from the full path's, 2 + r the
+    /// draws DrawSharedStrip answered RasterizerSgxd::StripRefusal r (None the checked ones;
+    /// NotKept, ProgramsChanged, Pending and SecondaryCopied apart).
+    [[nodiscard]] static u64 ToolsStripCheck(int which);
+    /// The first mismatch's first differing field, "-" for none yet.
+    [[nodiscard]] static const char* ToolsStripCheckField();
 #endif
 #endif
     static void SetReadbackHolds(bool on);

@@ -252,6 +252,48 @@ public:
         gs_indices.assign(indices, indices + bytes);
         gs_indices_set = true;
     }
+    /// Strip runs (RenderThread::DrawStripRun): indexed strips whose state is the run's first
+    /// draw's but the index list (0x227) and count (0x228). While a run is armed, Draw keeps a
+    /// draw's finished submission when another draw of the run may share it (shared_strip), and
+    /// DrawSharedStrip submits a later draw from it: the same setup, its own index list and count,
+    /// after cleaning its own index list and vertex range.
+    /// NotKept: no draw kept (or the kept one not shareable); ProgramsChanged: programs replaced
+    /// or a second tier ready; Pending: a DMA's retire or the code heap's flush due first;
+    /// SecondaryCopied: the full path would place another copy of a secondary PDS program.
+    enum class StripRefusal : u8 {
+        None,
+        NotKept,
+        ProgramsChanged,
+        Pending,
+        SecondaryCopied,
+        PassChanged,
+        NoRoom,
+        IndexRange,
+        Count_
+    };
+    void BeginStripRun();
+    void EndStripRun();
+    /// The run's next draw from the kept submission, its registers set as the guest had them;
+    /// `scanned` and `cleaned` as its record has them (ScannedIndices, GeometryCleaned). Refused:
+    /// nothing submitted, the draw takes the full path, and the draw that does keeps its own.
+    /// `submit` false builds the submission without drawing (the tools check, LastShared).
+    StripRefusal DrawSharedStrip(u32 count, PAddr index_address,
+                                 std::optional<std::pair<u32, u32>> scanned, u16 cleaned,
+                                 bool submit);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    /// Tools builds' strip-run check: what DrawSharedStrip built last, and the backend's last
+    /// draw (SgxdBackend::LastDraw) to compare it with.
+    struct SharedSubmission {
+        SgxdRecipeDraw draw;
+        SgxdRecipeDrawPrograms p;
+    };
+    [[nodiscard]] const SharedSubmission& LastShared() const {
+        return last_shared;
+    }
+    [[nodiscard]] const SgxdBackend& ToolsBackend() const {
+        return backend;
+    }
+#endif
     bool AcceleratesGeometryShaders() const override {
         return true;
     }
@@ -1060,6 +1102,46 @@ private:
     bool layout_regs_dirty = true;
     std::optional<std::pair<u32, u32>> scanned_indices;
     u16 cleaned_geometry = 0;
+    /// A strip run's kept submission (DrawSharedStrip): `ok` when another draw of the run may
+    /// share it. The feeds and input registers are its vertex stage's (VertexStageFor), the pass
+    /// mark, data opens, PDS generation, colour buffer and programs' generation those it drew
+    /// under, `fragment` its fragment program.
+    struct SharedStrip {
+        bool ok;
+        SgxdRecipeDraw draw;
+        SgxdRecipeDrawPrograms p;
+        std::array<VertexFeed, 16> feeds;
+        u32 feed_count;
+        u16 input_regs;
+        u32 pass_mark;
+        u32 data_opens;
+        u32 pds_generation;
+        PAddr colour;
+        u32 programs_generation;
+        /// The kept draw's programs: the values of fragment_programs and vertex_programs, which
+        /// stay where they are put (KeyIndex's deque; a second tier replaces one in place) until
+        /// FlushPrograms clears them, which steps programs_generation (refused from then on).
+        FragmentProgram* fragment;
+        u64 fragment_key;
+        VertexProgram* vertex;
+        /// VertexProgramFor's key and inputs for `vertex`, for its second tier's step (set
+        /// whenever VertexProgramFor ran for the draw, which it does while the program's second
+        /// tier is not queued).
+        u64 vertex_key;
+        VertexInputs vertex_in;
+        bool blend; ///< for PerflogDraw
+        /// The vertex and pixel secondaries' SA images, sizes and programs (SecondaryHeld).
+        u32 vsa, vsa_words, vsa_doutu0;
+        u32 fsa, fsa_words, fsa_doutu0;
+    };
+    SharedStrip shared_strip{};
+    bool strip_run_armed = false;
+    /// Steps where the programs a kept submission points at may be replaced (InstallTier2,
+    /// FlushPrograms).
+    u32 programs_generation = 0;
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    SharedSubmission last_shared{};
+#endif
     std::vector<u8> gs_indices;
     bool gs_indices_set = false;
     /// The second tier's programs of earlier runs. Before the tiers, whose workers read and
