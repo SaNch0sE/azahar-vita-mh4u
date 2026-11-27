@@ -6312,6 +6312,10 @@ void RasterizerSgxd::InstallFragmentTier2(u64 key, const Usse::Program& program)
     if (!old) {
         return;
     }
+    // The program is replaced where it stands: a strip run's kept submission (DrawSharedStrip) holds
+    // the old one's addresses, so it must refuse and the full path re-keep. QueueFragmentTier2 gets
+    // here at once when the config's second tier is done, not only through InstallTier2.
+    programs_generation++;
     DumpProgram("fs2", key, program);
     const u32 temps_before = old->usse.temp_count;
     const std::size_t words_before = old->usse.primary.size();
@@ -6364,6 +6368,8 @@ void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
     ASSERT_MSG(result.input_regs == old->input_regs,
                "sgxd: tier 2 of vertex program {:016x} reads input registers {:#x}, tier 1 {:#x}",
                result.key, result.input_regs, old->input_regs);
+    // As InstallFragmentTier2: a replacement in place ends a strip run's kept submission.
+    programs_generation++;
     DumpProgram("vs2", result.key, *result.program);
     const u32 temps_before = old->usse.temp_count;
     const std::size_t words_before = old->usse.primary.size();
