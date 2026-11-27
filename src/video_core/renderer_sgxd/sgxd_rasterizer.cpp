@@ -7087,6 +7087,9 @@ RasterizerSgxd::StripRefusal RasterizerSgxd::DrawSharedStrip(
             }
 #endif
             if (submit) {
+                // Not mirrored on purpose: SyncDrawUniforms and the fragment_regs_dirty /
+                // layout_regs_dirty updates. Between a run's draws only the 0x227/0x228 dirty marks
+                // exist, and they stay set for the next full Draw.
                 // As Draw counts a draw.
                 draw_serial++;
                 bool skipped = false;
