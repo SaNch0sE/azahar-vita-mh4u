@@ -2221,6 +2221,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                          st[0], st[1], st[3], st[2]);
                     // The strip-run check (sgxd flag stripcheck): draws checked, mismatches since
                     // the start and the first one's field, DrawSharedStrip's answers by refusal.
+                    // Without stripcheck, "none" is the draws shared, the refusals those drawn
+                    // in full.
                     static std::array<u64, 10> last_sc{};
                     std::array<u64, 10> sc{};
                     for (int k = 0; k < 10; k++) {
@@ -2228,7 +2230,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         last_sc[k] += sc[k];
                     }
                     sites += fmt::format("; strip check: checked {} mismatches {} (first {}), "
-                                         "none {} not kept {} programs changed {} pending {} "
+                                         "none (shared) {} not kept {} programs changed {} pending {} "
                                          "secondary copied {} pass changed {} no room {} "
                                          "index range {}",
                                          sc[0], last_sc[1],

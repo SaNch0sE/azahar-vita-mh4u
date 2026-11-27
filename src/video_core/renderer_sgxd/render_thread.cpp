@@ -1084,15 +1084,19 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count, u16 cleaned) {
 }
 
 void RenderThread::DrawStripRun(const StripRunDraw* list, u32 n) {
-    // Each draw in full, with its index list and count; the first's after, as the run's record
-    // left them (the later draws' writes come with the next state).
+    // The first draw in full, with its index list and count; each later one from the first's
+    // submission (RasterizerSgxd::DrawSharedStrip), or in full where that refuses (a full draw
+    // keeps its own for the next). The first's registers after, as the run's record left them
+    // (the later draws' writes come with the next state).
     auto& regs = render_pica.regs.internal.reg_array;
     constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
     constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
 #if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
     // Tools builds' check: each later draw's shared submission built first (not drawn), then
-    // compared with what its full path drew.
+    // compared with what its full path drew; nothing shared.
     static const bool check = SgxdFlag("stripcheck");
+#else
+    constexpr bool check = false;
 #endif
     rasterizer.BeginStripRun();
     for (u32 k = 0; k < n; k++) {
@@ -1102,20 +1106,29 @@ void RenderThread::DrawStripRun(const StripRunDraw* list, u32 n) {
         regs[NumReg] = d.count;
         render_pica.dirty_regs.Set(IndexReg);
         render_pica.dirty_regs.Set(NumReg);
-#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
-        bool compare = false;
-        u32 calls = 0;
-        StripPassState before{};
-        if (check && k != 0) {
+        RasterizerSgxd::StripRefusal why = RasterizerSgxd::StripRefusal::NotKept;
+        if (k != 0) {
             const auto& pipeline = render_pica.regs.internal.pipeline;
             const PAddr index_address =
                 pipeline.vertex_attributes.GetPhysicalBaseAddress() + pipeline.index_array.offset;
             const auto scanned = d.indices.scanned != 0
                                      ? std::optional{std::pair<u32, u32>{d.indices.lo, d.indices.hi}}
                                      : std::nullopt;
-            const RasterizerSgxd::StripRefusal why = rasterizer.DrawSharedStrip(
-                d.count, index_address, scanned, d.indices.cleaned, false);
+            why = rasterizer.DrawSharedStrip(d.count, index_address, scanned, d.indices.cleaned,
+                                             !check);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+            // Without stripcheck, None counts the draws shared.
             tools_strip_check[2 + static_cast<u32>(why)].fetch_add(1, std::memory_order_relaxed);
+#endif
+            if (!check && why == RasterizerSgxd::StripRefusal::None) {
+                continue;
+            }
+        }
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+        bool compare = false;
+        u32 calls = 0;
+        StripPassState before{};
+        if (check && k != 0) {
             compare = why == RasterizerSgxd::StripRefusal::None;
             calls = rasterizer.ToolsBackend().DrawCalls();
             before = StripPassState::Of(rasterizer.ToolsBackend());

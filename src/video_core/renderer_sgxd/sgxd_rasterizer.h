@@ -1133,6 +1133,7 @@ private:
         u64 vertex_key;
         VertexInputs vertex_in;
         bool blend; ///< for PerflogDraw
+        bool keeps_alpha; ///< a translucent alpha-keeping draw (keep_alpha_translucents)
         /// The vertex and pixel secondaries' SA images, sizes and programs (SecondaryHeld).
         u32 vsa, vsa_words, vsa_doutu0;
         u32 fsa, fsa_words, fsa_doutu0;

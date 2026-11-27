@@ -7091,6 +7091,8 @@ RasterizerSgxd::StripRefusal RasterizerSgxd::DrawSharedStrip(
                 if (!skipped) {
                     backend.Draw(draw, p);
                     pass_guest_draws++;
+                    // As Draw counts an alpha-keeping draw (the kept one was not opaque).
+                    keep_alpha_translucents += shared_strip.keeps_alpha ? 1 : 0;
                     if (const auto [lo, hi] = DrawnRows(); lo < hi) {
                         const bool first = pass_drawn_lo >= pass_drawn_hi;
                         pass_drawn_lo = first ? lo : std::min(pass_drawn_lo, lo);
@@ -10138,6 +10140,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             shared_strip.fsa_words = fsa_words;
             shared_strip.fsa_doutu0 = fp.secondary_doutu0;
             shared_strip.blend = blend;
+            shared_strip.keeps_alpha = keeps_alpha;
         }
     }
     if (keep_alpha_opaque) {
