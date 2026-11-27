@@ -10093,7 +10093,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         // apart from what it drew, and which samples nothing of the pass's own buffers (a later
         // draw's full path would end the pass for that).
         const auto samples_targets = [&] {
-            const u32 sampled = Usse::SampledTextureUnits(FragmentConfig());
+            if (fp.sampled_units == 0xff) {
+                fp.sampled_units = static_cast<u8>(Usse::SampledTextureUnits(FragmentConfig()));
+            }
+            const u32 sampled = fp.sampled_units;
             const PAddr depth_lo = fb.GetDepthBufferPhysicalAddress();
             const PAddr depth_hi =
                 depth_lo + buffer.width * buffer.height *

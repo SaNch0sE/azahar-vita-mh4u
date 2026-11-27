@@ -576,6 +576,9 @@ private:
         mutable SgxdBackend::Data buf_last_data{};
         mutable u32 pixel_size = 0;
         mutable u32 pixel_size_sa = ~0u;
+        /// Usse::SampledTextureUnits of its config (the key holds the config), 0xff until a
+        /// strip run's keep asks (Draw): emitting to find them costs as much as a draw's setup.
+        mutable u8 sampled_units = 0xff;
     };
     /// Draws after which a program is emitted again with the optimising passes.
     static constexpr u32 Tier2Draws = 100;
