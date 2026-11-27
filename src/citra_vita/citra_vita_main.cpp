@@ -2107,6 +2107,26 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              draws != 0 ? (rc[2] - last_rc[2]) / draws : 0,
                              (rc[3] - last_rc[3]) / 1000, (rc[4] - last_rc[4]) / 1000);
                     last_rc = rc;
+                    {
+                        using RT = SgxdRenderer::RenderThread;
+                        static std::array<u64, RT::WaitSites * 2> last_site{};
+                        std::array<u64, RT::WaitSites * 2> site{};
+                        for (u32 k = 0; k < RT::WaitSites; k++) {
+                            site[k] = RT::ToolsTicketWait(k, false);
+                            site[RT::WaitSites + k] = RT::ToolsTicketWait(k, true);
+                        }
+                        const auto ms = [&](u32 k) { return (site[k] - last_site[k]) / 1000; };
+                        const auto n = [&](u32 k) {
+                            return site[RT::WaitSites + k] - last_site[RT::WaitSites + k];
+                        };
+                        LOG_INFO(Frontend,
+                                 "cpu: ticket waits ms/count: lead {}/{}, held page {}/{}, move "
+                                 "{}/{}, GPU read {}/{}, frame buffer {}/{}, versions {}/{}, GPU "
+                                 "writes {}/{}, other {}/{}",
+                                 ms(0), n(0), ms(1), n(1), ms(2), n(2), ms(3), n(3), ms(4), n(4),
+                                 ms(5), n(5), ms(6), n(6), ms(7), n(7));
+                        last_site = site;
+                    }
                     static u32 last_renders = 0;
                     const u32 renders = sgxd_session_renders();
 #ifdef VITA_DIAGNOSTICS

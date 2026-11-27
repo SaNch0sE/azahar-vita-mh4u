@@ -169,6 +169,26 @@ constexpr u32 LightingTableBytes = 256 * sizeof(u32);
 // Not libstdc++'s steady_clock, which is a gettimeofday syscall on the Vita.
 using Clock = Common::ProcessClock;
 
+#ifdef VITA_DEBUG_TOOLS
+/// Tools builds' cpu line: the emulation side's ticket waits by where they come from
+/// (RenderThread::ToolsTicketWait's sites); the waiting thread names its site for the wait's span.
+thread_local u32 tools_wait_site = RenderThread::WaitSiteOther;
+std::array<std::atomic<u64>, RenderThread::WaitSites> tools_site_us{};
+std::array<std::atomic<u64>, RenderThread::WaitSites> tools_site_waits{};
+struct ToolsWaitSite {
+    explicit ToolsWaitSite(u32 site) : saved{tools_wait_site} {
+        tools_wait_site = site;
+    }
+    ~ToolsWaitSite() {
+        tools_wait_site = saved;
+    }
+    u32 saved;
+};
+#define TOOLS_WAIT_SITE(site) const ToolsWaitSite tools_wait_site_scope{RenderThread::site}
+#else
+#define TOOLS_WAIT_SITE(site) ((void)0)
+#endif
+
 #ifdef VITA_DIAGNOSTICS
 u64 Since(Clock::time_point start) {
     return static_cast<u64>(
@@ -478,6 +498,7 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
         // The page's later holds carry the open ticket: no fence here.
         ASSERT_MSG(ticket != HoldTicket(),
                    "render thread: a page leaves its versions under the open ticket's reads");
+        TOOLS_WAIT_SITE(WaitSiteVersions);
         InterruptWait(ticket);
         return reached.load(std::memory_order_acquire);
     };
@@ -1604,6 +1625,7 @@ void RenderThread::WatchFrameBuffer(PAddr addr, u32 size) {
         const auto start = Clock::now();
 #endif
         // A read held since the last fence has no ticket yet: WaitTicket fences it first.
+        TOOLS_WAIT_SITE(WaitSiteFrameBuffer);
         WaitTicket(ticket);
 #ifdef VITA_DIAGNOSTICS
         frame_buffer_waits.fetch_add(1, std::memory_order_relaxed);
@@ -2547,6 +2569,11 @@ u64 RenderThread::ToolsEmuWaitUs(int kind) {
     return tools_emu_wait_us[kind].load(std::memory_order_relaxed);
 }
 
+u64 RenderThread::ToolsTicketWait(u32 site, bool count) {
+    return count ? tools_site_waits[site].load(std::memory_order_relaxed)
+                 : tools_site_us[site].load(std::memory_order_relaxed);
+}
+
 u64 RenderThread::ToolsRenderCounter(int which) {
     return tools_render[which].load(std::memory_order_relaxed);
 }
@@ -2750,10 +2777,18 @@ void RenderThread::InterruptWait(u64 ticket) {
 #ifdef VITA_DIAGNOSTICS
     const auto start = Clock::now();
 #endif
+#ifdef VITA_DEBUG_TOOLS
+    const u64 tools_start = sceKernelGetProcessTimeWide();
+#endif
     for (;;) {
         if (InterruptPoll(ticket)) {
 #ifdef VITA_DIAGNOSTICS
             CountEmuWait(EmuTicket, start);
+#endif
+#ifdef VITA_DEBUG_TOOLS
+            tools_site_us[tools_wait_site].fetch_add(sceKernelGetProcessTimeWide() - tools_start,
+                                                     std::memory_order_relaxed);
+            tools_site_waits[tools_wait_site].fetch_add(1, std::memory_order_relaxed);
 #endif
             return;
         }
@@ -2775,6 +2810,7 @@ void RenderThread::WaitForGpuWrites() {
         if (last_write_ticket == HoldTicket()) {
             InterruptFence();
         }
+        TOOLS_WAIT_SITE(WaitSiteGpuWrites);
         InterruptWait(last_write_ticket);
     }
 }
@@ -2829,6 +2865,7 @@ void RenderThread::WaitHeldPage(u32 page, bool write) {
     if (write) {
         CopyFault(page);
     }
+    TOOLS_WAIT_SITE(WaitSiteHeldPage);
     WaitTicket(page_holds.WaitFor(page, write, reached.load(std::memory_order_acquire)));
 }
 
@@ -2919,6 +2956,7 @@ RenderThread::HeldWrite RenderThread::TakeHeldWrite(u32 page, const u8* host, u3
     const auto opened = [&] {
         if (fcram && page_holds.MayMove(page, reached.load(std::memory_order_acquire)) &&
             renderer.WouldMakeUncached(address, 0x1000)) {
+            TOOLS_WAIT_SITE(WaitSiteMove);
             WaitTicket(page_holds.MoveTicket(page));
         }
         return HeldWrite::Open;
@@ -3041,6 +3079,7 @@ void RenderThread::GpuRead(const u8* host, u32 size) {
         const u8* const page_end =
             reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
         const u32 bytes = static_cast<u32>(std::min(end, page_end) - p);
+        TOOLS_WAIT_SITE(WaitSiteGpuRead);
         WaitTicket(page_holds.GpuReadWaitFor(p, bytes, reached.load(std::memory_order_acquire)));
     }
 }
@@ -3287,6 +3326,7 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         // guest's writes while the render thread copies the page. The store runs again once the move is
         // done; a fault of the guest's own aborts again, with no move left.
         if (write && page_holds.MayMove(page, reached.load(std::memory_order_acquire))) {
+            TOOLS_WAIT_SITE(WaitSiteMove);
             WaitTicket(page_holds.MoveTicket(page));
             return true;
         }
@@ -3900,6 +3940,7 @@ void RenderThread::EndFrame() {
         const auto wait_start = Clock::now();
 #endif
         SgxdTrace("lead_wait");
+        TOOLS_WAIT_SITE(WaitSiteLead);
         InterruptWait(lead);
         SgxdTrace("lead_wait_end");
 #ifdef VITA_DIAGNOSTICS
